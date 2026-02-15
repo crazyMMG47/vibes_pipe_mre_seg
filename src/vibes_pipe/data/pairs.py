@@ -1,0 +1,493 @@
+import json
+import numpy as np
+import nibabel as nib
+import torch
+from scipy import ndimage
+from scipy.io import loadmat
+import os
+import glob
+import tempfile
+from pathlib import Path
+from torch.utils.data import DataLoader, Dataset
+from typing import Tuple, List, Dict, Optional, Union
+import pickle
+
+# import module
+from vibes_pipe.data.preprocess_data import Preprocessor, mat_to_nii
+from vibes_pipe.augmentation.augmentation_pipeline import MREAugmentation
+
+
+class NoiseProfileManager:
+    """
+    Manages loading and matching of scanner-specific noise profiles.
+    Each subject has their own noise profile.
+    """
+    
+    def __init__(self, noise_dir: Union[str, Path]):
+        """
+        Initialize noise profile manager.
+        
+        Args:
+            noise_dir: Directory containing all noise profiles (*_noise.mat)
+        """
+        self.noise_dir = Path(noise_dir)
+        self.noise_profiles: Dict[str, Dict[str, np.ndarray]] = {}
+        self.available_subjects: List[str] = []
+        
+        self._load_all_profiles()
+    
+    def _load_all_profiles(self):
+        """Load all noise profiles from directory."""
+        if not self.noise_dir.exists():
+            raise ValueError(f"Noise directory does not exist: {self.noise_dir}")
+        
+        noise_files = sorted(self.noise_dir.glob("*_noise.mat"))
+        
+        if not noise_files:
+            print(f"Warning: No *_noise.mat files found in {self.noise_dir}")
+            return
+        
+        for noise_file in noise_files:
+            try:
+                # Extract subject ID (e.g., S001_noise.mat -> S001)
+                subject_id = noise_file.stem.replace('_noise', '')
+                
+                # Load noise profile
+                noise_data = loadmat(str(noise_file))
+                
+                # Check for 'noise' first, then 'noise_scaled'
+                if 'noise' in noise_data:
+                    noise_array = noise_data['noise']
+                elif 'noise_scaled' in noise_data:
+                    noise_array = noise_data['noise_scaled']
+                else:
+                    print(f"Warning: No 'noise' or 'noise_scaled' field in {noise_file.name}")
+                    continue
+                
+                noise_array = np.asarray(noise_array).squeeze()
+                
+                # Store profile
+                self.noise_profiles[subject_id] = {
+                    'noise': noise_array,
+                    'shape': noise_array.shape
+                }
+                
+                self.available_subjects.append(subject_id)
+                
+            except Exception as e:
+                print(f"Failed to load {noise_file.name}: {e}")
+    
+    def get_profile(self, subject_id: str) -> Optional[np.ndarray]:
+        """
+        Get noise profile for a specific subject.
+        
+        Args:
+            subject_id: Subject identifier (e.g., 'S001', 'G028')
+        
+        Returns:
+            Noise array or None if not found
+        """
+        # Direct match
+        if subject_id in self.noise_profiles:
+            return self.noise_profiles[subject_id]['noise']
+        
+        # Fuzzy match: subject_id starts with profile_id
+        for profile_id in self.available_subjects:
+            if subject_id.startswith(profile_id):
+                return self.noise_profiles[profile_id]['noise']
+        
+        # Partial match: profile_id is in subject_id
+        for profile_id in self.available_subjects:
+            if profile_id in subject_id:
+                return self.noise_profiles[profile_id]['noise']
+        
+        return None
+    
+    def has_profile(self, subject_id: str) -> bool:
+        """Check if noise profile exists for subject."""
+        return self.get_profile(subject_id) is not None
+
+
+def create_and_save_pairs(
+    t2_dir: str,
+    mask_dir: str,
+    train_txt: str,
+    val_txt: str,
+    test_txt: str,
+    noise_dir: Optional[str] = None,
+    output_file: str = 'pairs_mapping.json'
+):
+    """
+    Create pairs once and save to JSON file for reuse.
+    Includes noise profile information if available.
+    Run this ONCE before preprocessing.
+    
+    Args:
+        t2_dir: Directory containing T2 images
+        mask_dir: Directory containing segmentation masks
+        train_txt: Path to training split file
+        val_txt: Path to validation split file
+        test_txt: Path to test split file
+        noise_dir: Optional directory containing noise profiles
+        output_file: Output JSON file path
+    """
+    print("\n" + "="*70)
+    print("CREATING AND SAVING PAIRS MAPPING")
+    print("="*70)
+    
+    # Initialize noise manager if directory provided
+    noise_manager = None
+    noise_dir_path = None
+    if noise_dir and os.path.exists(noise_dir):
+        try:
+            noise_dir_path = Path(noise_dir)
+            noise_manager = NoiseProfileManager(noise_dir)
+            print(f"✓ Loaded {len(noise_manager.available_subjects)} noise profiles")
+        except Exception as e:
+            print(f"⚠️  Could not load noise profiles: {e}")
+    
+    # Read split files
+    def read_ids(path):
+        with open(path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    
+    splits = {
+        'train': read_ids(train_txt),
+        'val': read_ids(val_txt),
+        'test': read_ids(test_txt)
+    }
+    
+    # Get all available files
+    t2_files = {Path(f).stem.split('.')[0]: f for f in glob.glob(os.path.join(t2_dir, "*.nii*"))}
+    
+    mask_files = {}
+    for f in glob.glob(os.path.join(mask_dir, "*.nii*")) + glob.glob(os.path.join(mask_dir, "*.mat")):
+        subject_id = Path(f).stem.split('.')[0]
+        mask_files[subject_id] = f
+    
+    # Create pairs for all splits
+    all_pairs = {}
+    
+    for split_name, split_ids in splits.items():
+        print(f"\n--- Finding pairs for {split_name} ---")
+        
+        pairs = []
+        for subject_id in split_ids:
+            # Find T2 image
+            t2_path = None
+            for t2_id, t2_file in t2_files.items():
+                if subject_id in t2_id or t2_id in subject_id:
+                    t2_path = t2_file
+                    break
+            
+            # Find mask
+            mask_path = None
+            for mask_id, mask_file in mask_files.items():
+                if subject_id in mask_id or mask_id in subject_id:
+                    mask_path = mask_file
+                    break
+            
+            # Check for noise profile and get the file path
+            noise_file_path = None
+            noise_shape = None
+            if noise_manager and noise_manager.has_profile(subject_id):
+                # Construct the noise file path
+                noise_file_path = str(noise_dir_path / f"{subject_id}_noise.mat")
+                # Verify it exists and get shape
+                if os.path.exists(noise_file_path):
+                    try:
+                        noise_data = loadmat(noise_file_path)
+                        if 'noise' in noise_data:
+                            noise_array = np.asarray(noise_data['noise']).squeeze()
+                        elif 'noise_scaled' in noise_data:
+                            noise_array = np.asarray(noise_data['noise_scaled']).squeeze()
+                        else:
+                            noise_array = None
+                        
+                        if noise_array is not None:
+                            noise_shape = noise_array.shape
+                    except Exception as e:
+                        print(f"    Warning: Could not read noise shape for {subject_id}: {e}")
+                        noise_file_path = None
+                else:
+                    noise_file_path = None
+            
+            if t2_path and mask_path:
+                # Get image shape
+                try:
+                    image_shape = nib.load(t2_path).shape
+                except Exception as e:
+                    print(f"    Warning: Could not read image shape for {subject_id}: {e}")
+                    image_shape = None
+                
+                # Get label shape
+                try:
+                    if mask_path.endswith('.mat'):
+                        mask_data = loadmat(mask_path)
+                        # Try common mask field names
+                        for key in ['mask', 'label', 'seg', 'segmentation']:
+                            if key in mask_data:
+                                label_shape = np.asarray(mask_data[key]).squeeze().shape
+                                break
+                        else:
+                            # If no common key found, use the first non-metadata array
+                            for key, value in mask_data.items():
+                                if not key.startswith('__') and isinstance(value, np.ndarray):
+                                    label_shape = np.asarray(value).squeeze().shape
+                                    break
+                            else:
+                                label_shape = None
+                    else:
+                        label_shape = nib.load(mask_path).shape
+                except Exception as e:
+                    print(f"    Warning: Could not read label shape for {subject_id}: {e}")
+                    label_shape = None
+                
+                pair_info = {
+                    'image': t2_path,
+                    'label': mask_path,
+                    'subject_id': subject_id,
+                    'noise_path': noise_file_path,
+                    'image_shape': image_shape,
+                    'label_shape': label_shape,
+                    'noise_shape': noise_shape
+                }
+                pairs.append(pair_info)
+                
+                noise_status = "✓ with noise" if noise_file_path else "○ no noise"
+                shape_info = f"img:{image_shape}, lbl:{label_shape}"
+                if noise_shape:
+                    shape_info += f", noise:{noise_shape}"
+                print(f"  ✓ {subject_id} {noise_status} ({shape_info})")
+            else:
+                missing = []
+                if not t2_path:
+                    missing.append('T2')
+                if not mask_path:
+                    missing.append('mask')
+                print(f"  ✗ {subject_id} - missing {', '.join(missing)}")
+        
+        all_pairs[split_name] = pairs
+        noise_count = sum(1 for p in pairs if p['noise_path'] is not None)
+        print(f"Found {len(pairs)} pairs for {split_name} ({noise_count} with noise profiles)")
+    
+    # Save to JSON
+    with open(output_file, 'w') as f:
+        json.dump(all_pairs, f, indent=2)
+    
+    print(f"\n✓ Saved pairs mapping to {output_file}")
+    print("="*70 + "\n")
+    
+    return all_pairs
+
+
+def load_pairs_from_file(pairs_file: str = 'pairs_mapping.json') -> Dict:
+    """Load pre-computed pairs from JSON file"""
+    with open(pairs_file, 'r') as f:
+        return json.load(f)
+
+
+def preprocess_and_save_as_dict(
+    pairs_file: str,
+    output_dir: str,
+    target_spacing: Tuple[float, float, float] = (1.5, 1.5, 1.5),
+    target_size: Tuple[int, int, int] = (128, 128, 64),
+    is_2d: bool = False
+):
+    """
+    Preprocess pairs and save as dictionaries with resized noise profiles.
+    Each sample dict contains: image, label, subject_id, noise (resized to match image).
+    
+    Args:
+        pairs_file: Path to JSON file with pairs mapping
+        output_dir: Output directory for preprocessed data
+        target_spacing: Target voxel spacing
+        target_size: Target image size
+        is_2d: Whether to process as 2D data
+    """
+    print("\n" + "="*70)
+    print("PREPROCESSING WITH DICTIONARY FORMAT")
+    print("="*70)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    all_pairs = load_pairs_from_file(pairs_file)
+    preprocessor = Preprocessor(target_spacing, target_size, is_2d)
+    
+    for split_name, pairs in all_pairs.items():
+        print(f"\n--- Processing {split_name} split ({len(pairs)} subjects) ---")
+        if not pairs:
+            print(f"⚠️  No pairs for {split_name} split!")
+            continue
+        
+        dataset_list = []
+        for pair in pairs:
+            try:
+                # Process image and label
+                label_path = mat_to_nii(pair['label'], pair['image']) if pair['label'].endswith('.mat') else pair['label']
+                img, lbl, orig_shape = preprocessor.process_pair(pair['image'], label_path)
+                
+                # Load, resize, and normalize noise profile
+                noise_profile = None
+                if pair.get('noise_path') and os.path.exists(pair['noise_path']):
+                    try:
+                        noise_data = loadmat(pair['noise_path'])
+                        
+                        # Check for 'noise' first, then 'noise_scaled'
+                        if 'noise' in noise_data:
+                            noise_raw = np.asarray(noise_data['noise']).squeeze()
+                        elif 'noise_scaled' in noise_data:
+                            noise_raw = np.asarray(noise_data['noise_scaled']).squeeze()
+                        else:
+                            noise_raw = None
+                        
+                        if noise_raw is not None:
+                            # Apply rotation for GE scanners (subjects starting with 'G')
+                            if pair['subject_id'].startswith('G') and len(noise_raw.shape) == 3:
+                                noise_raw = np.rot90(noise_raw, k=-3, axes=(0, 1))  # Rotate 90° in first two axes
+                            
+                            # Resize noise to match target image size
+                            if len(noise_raw.shape) == 3:
+                                noise_profile = ndimage.zoom(
+                                    noise_raw, 
+                                    np.array(target_size) / np.array(noise_raw.shape),
+                                    order=1  # Linear interpolation
+                                )
+                            else:
+                                noise_profile = noise_raw  # Keep 1D/2D noise as-is
+                            
+                            # Normalize noise to [0, 1] range
+                            noise_min = noise_profile.min()
+                            noise_max = noise_profile.max()
+                            if noise_max > noise_min:
+                                noise_profile = (noise_profile - noise_min) / (noise_max - noise_min)
+                            else:
+                                print(f"    ⚠ Constant noise for {pair['subject_id']}, setting to zeros")
+                                noise_profile = np.zeros_like(noise_profile)
+                    except Exception as e:
+                        print(f"    ⚠ Could not load/resize noise for {pair['subject_id']}: {e}")
+                
+                dataset_list.append({
+                    'image': img,
+                    'label': lbl,
+                    'subject_id': pair['subject_id'],
+                    'original_shape': orig_shape,
+                    'noise': noise_profile
+                })
+                
+                noise_status = "✓" if noise_profile is not None else "○"
+                print(f"  {noise_status} {pair['subject_id']}")
+                
+            except Exception as e:
+                print(f"  ✗ Error processing {pair['subject_id']}: {e}")
+        
+        if not dataset_list:
+            print(f"⚠️  No successful processing for {split_name} split!")
+            continue
+        
+        # Save dataset in split subdirectory
+        split_dir = os.path.join(output_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        output_path = os.path.join(split_dir, 'dataset.pkl')
+        
+        noise_count = sum(1 for s in dataset_list if s['noise'] is not None)
+        with open(output_path, 'wb') as f:
+            pickle.dump({
+                'samples': dataset_list,
+                'metadata': {
+                    'num_samples': len(dataset_list),
+                    'target_spacing': target_spacing,
+                    'target_size': target_size,
+                    'is_2d': is_2d,
+                    'has_noise': noise_count > 0
+                }
+            }, f)
+        
+        print(f"✓ Saved {split_name}: {len(dataset_list)} samples ({noise_count} with noise) to {output_path}")
+    
+    print("\n" + "="*70)
+    print("PREPROCESSING COMPLETE")
+    print("="*70 + "\n")
+
+
+def load_preprocessed_dataset(dataset_path: str) -> Dict:
+    """
+    Load preprocessed dataset from pickle file.
+    
+    Args:
+        dataset_path: Path to dataset.pkl file
+        
+    Returns:
+        Dictionary with 'samples' (list of dicts) and 'metadata'
+    """
+    with open(dataset_path, 'rb') as f:
+        return pickle.load(f)
+
+
+class DictDataset(Dataset):
+    """
+    PyTorch Dataset that works with dictionary format.
+    Applies augmentations to NumPy arrays before tensor conversion.
+    """
+    
+    def __init__(self, 
+                 data: dict,
+                 augmentation_pipeline: Optional[MREAugmentation] = None):
+        """
+        Args:
+            dataset_path: Path to dataset.pkl file
+            augmentation_pipeline: Optional, pre-initialized MREAugmentation pipeline.
+                                   If None, no augmentations are applied.
+        """
+        self.data = data
+        self.samples = self.data['samples']
+        self.metadata = self.data['metadata']
+        self.augmenter = augmentation_pipeline
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # --- 1. Load data as NumPy arrays ---
+        image_np = sample['image']
+        label_np = sample['label']
+        noise_np = sample.get('noise', None) # Safely get noise, or None
+        subject_id = sample['subject_id']
+
+        # --- 2. Apply augmentation pipeline (if it exists) ---
+        if self.augmenter is not None:
+            image_np, label_np, noise_np = self.augmenter(
+                image=image_np,
+                label=label_np,
+                subject_id=subject_id,
+                noise_field=noise_np,
+                is_2d=False # Assuming 3D data, set to True if 2D
+            )
+        
+        # --- 3. Convert (potentially augmented) arrays to Tensors ---
+        # Using .copy() is a good practice to ensure tensors are C-contiguous
+        # and avoids "negative stride" errors after some NumPy operations.
+        image = torch.from_numpy(image_np.copy()).unsqueeze(0).float()
+        label = torch.from_numpy(label_np.copy()).unsqueeze(0).float()
+        
+        output = {
+            'image': image,
+            'label': label,
+            'subject_id': subject_id,
+            'original_shape': sample['original_shape']
+        }
+        
+        if noise_np is not None:
+            # Add channel dim if noise is [D, H, W]
+            if noise_np.ndim == 3:
+                noise = torch.from_numpy(noise_np.copy()).unsqueeze(0).float()
+            else: # Assuming [H, W] or already has channel
+                noise = torch.from_numpy(noise_np.copy()).float()
+            output['noise'] = noise
+        
+        return output
+    
+    def has_noise(self):
+        """Check if this dataset includes noise profiles"""
+        return self.metadata.get('has_noise', False)
