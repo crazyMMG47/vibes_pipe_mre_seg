@@ -1,0 +1,12 @@
+{
+  "pairs": [
+    {
+      "split": "train",
+      "x": "/data/subj001_X.mat",
+      "gt": "/data/subj001_GT.mat",
+      "eligible_preds": null,
+      "nli": null,
+      "meta": {"subject_id": "subj001"}
+    }
+  ]
+}
