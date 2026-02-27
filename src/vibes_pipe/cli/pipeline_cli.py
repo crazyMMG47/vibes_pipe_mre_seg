@@ -18,18 +18,8 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-# ---- Import your helpers (adjust import path to match your repo) ----
-# If pipeline_cli.py is in vibes_pipe/cli and helpers_data_prep.py is next to it:
-from helpers_data_prep import (  # type: ignore
-    read_json,
-    write_json_atomic,
-    build_workspace_from_pairs,
-)
-
-# If you have a config reader elsewhere, plug it in here.
-# from vibes_pipe.utils.config import load_config
-
+from data import read_json, write_json_atomic, build_workspace_from_pairs
+ 
 
 # ----------------------------
 # Commands
@@ -47,6 +37,8 @@ def cmd_prep(args: argparse.Namespace) -> int:
 
     # Load pairs spec
     pairs_data = read_json(pairs_json_path)
+    if isinstance(pairs_data, dict) and "pairs" in pairs_data:
+        pairs_data = pairs_data["pairs"]
     if not isinstance(pairs_data, list):
         raise ValueError("pairs.json must contain a top-level list of pair items.")
 
