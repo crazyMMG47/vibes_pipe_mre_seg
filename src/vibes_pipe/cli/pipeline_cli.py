@@ -18,8 +18,8 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from data import read_json, write_json_atomic, build_workspace_from_pairs
- 
+
+from vibes_pipe.cli.helpers_data_prep import read_json, write_json_atomic, build_workspace_from_pairs
 
 # ----------------------------
 # Commands

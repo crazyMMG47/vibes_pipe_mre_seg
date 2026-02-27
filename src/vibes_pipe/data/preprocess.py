@@ -1,6 +1,7 @@
 """
 A preprocessor class handling clahe, resampling, resizing, and normalization.
 
+It accepts a config dict and is able to perform the image preprocessing tailored the user config. 
 """
 
 
@@ -21,17 +22,43 @@ class Preprocessor:
     """
 
     def __init__(self, cfg: Dict[str, Any] | None = None) -> None:
+        # cfg is a python dict, loaded from yaml file
+        # fallback default value is set in case no yaml is provided
         cfg = cfg or {}
         p = cfg.get("preprocess", cfg)  # allow passing either full yaml or preprocess sub-dict
-
+        
         self.target_spacing = tuple(p.get("target_spacing", (1.5, 1.5, 1.5)))
         ts = p.get("target_size", (128, 128, 64))
         self.target_size = None if ts is None else tuple(ts)
 
-        self.clahe_cfg = p.get("clahe", {})
-        self.resample_cfg = p.get("resample", {})
-        self.norm_cfg = p.get("normalize", {})
-        self.label_cfg = p.get("label", {})
+        # ---- sub-configs with safe defaults ----
+        self.clahe_cfg = {
+            "enabled": True,
+            "clip_limit": 2.0,
+            "tile_grid_size": (8, 8),
+            **p.get("clahe", {}),
+        }
+
+        self.resample_cfg = {
+            "enabled": True,
+            "order_image": 1,
+            "order_label": 0,
+            "prefilter": False,
+            **p.get("resample", {}),
+        }
+
+        self.norm_cfg = {
+            "enabled": True,
+            "mask_positive_only": True,
+            "eps": 1e-8,
+            **p.get("normalize", {}),
+        }
+
+        self.label_cfg = {
+            "binarize_threshold": 0.5,
+            "dtype": "float32",
+            **p.get("label", {}),
+        }
 
     def load_mat_volume(
         self, filepath: str

@@ -1,0 +1,30 @@
+preprocess:
+  # output geometry
+  target_spacing: [1.5, 1.5, 1.5]
+  target_size: [128, 128, 64]          # set to null to skip final resize
+
+  # CLAHE settings (OpenCV)
+  clahe:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+    percentile_clip: [1, 99]           # (p_low, p_high)
+    eps: 1.0e-8
+
+  # resampling settings (scipy.ndimage.zoom)
+  resample:
+    enabled: true
+    order_image: 1                     # linear
+    order_label: 0                     # nearest
+    prefilter: false                   # keep as in your code
+
+  # label handling
+  label:
+    binarize_threshold: 0.5
+    dtype: float32
+
+  # normalization settings
+  normalize:
+    enabled: true
+    mask_positive_only: true           # only voxels > 0
+    eps: 1.0e-8

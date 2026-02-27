@@ -24,6 +24,8 @@ def collect_subjects(root: Path) -> List[Dict]:
         subj_id = subj_dir.name
 
         x_path = subj_dir / f"{subj_id}_t2stack.mat"
+        nifti_path = subj_dir / f"{subj_id}_t2stack.nii"
+        
         gt_path = subj_dir / f"{subj_id}_mask.mat"
 
         mu_path = subj_dir / f"{subj_id}_Mu.mat"
@@ -40,9 +42,10 @@ def collect_subjects(root: Path) -> List[Dict]:
         pairs.append(
             {
                 "id": subj_id,
-                "split": "train",  # temporary, may be overwritten
-                "X": str(x_path.resolve()),
-                "GT": str(gt_path.resolve()),
+                "split": "train",  # temporary, may be overwritten by splitting
+                "t2stack": str(x_path.resolve()),
+                "t2stack_nii": str(nifti_path.resolve()),
+                "GT(human)": str(gt_path.resolve()),
                 "eligible_preds": str(prob_path.resolve()) if prob_path.exists() else None,
                 "NLI_output": str(mu_path.resolve()) if mu_path.exists() else None,
                 "meta": {},
@@ -69,13 +72,6 @@ def assign_splits(pairs: List[Dict], train_ratio=0.8, val_ratio=0.1) -> None:
             item["split"] = "test"
             
 
-def bypass_split():
-    """
-    Under low-maintenance mode, all the input new files will be marked as "train".
-    
-    """
-    pass
-
 
 def main(mode="bypass"):
     """
@@ -101,14 +97,16 @@ def main(mode="bypass"):
     print(f"Found {len(pairs)} valid subjects.")
 
     # ---- Ask about split ----
-    print("Below we will prompt you to enter your data splitting mode. Just press [enter] or type 'default' for regular segmentation OR type 'training' to re-assign train/val/test data labels.\n\n")
+    print("Below we will prompt you to enter your data splitting mode. Just press [enter] or type 'default' for regular segmentation OR type 're-training' to re-assign train/val/test data labels.\n\n")
     split_choice = input("Mode of training [default/training]: \n\n ").strip().lower()
 
     if split_choice in ("", "y", "yes", "default"): # assign typical training
         assign_splits(pairs, train_ratio=0.8, val_ratio=0.1)
         print("Applied 80/10/10 split.")
-    elif split_choice in ("training", "train"):
+        
+    elif split_choice in ("retraining", "retrain"):
         print("All subjects set to train.")
+        
     else:
         print("I can't understand your choice of split. Try again! ")
         
