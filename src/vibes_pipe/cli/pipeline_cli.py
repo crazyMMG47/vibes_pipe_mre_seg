@@ -10,6 +10,8 @@ Usage examples:
   python pipeline_cli.py prep --pairs_json pairs.json --out_dir ./workspace_root
   python pipeline_cli.py prep --pairs_json pairs.json --out_dir ./workspace_root --overwrite
   python pipeline_cli.py train --config configs/config.yaml --workspace_root ./workspace_root
+  
+  python pipeline_cli.py
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from vibes_pipe.cli.helpers_data_prep import read_json, write_json_atomic, build_workspace_from_pairs
+from vibes_pipe.cli.workspace_prep import read_json, write_json_atomic, build_workspace_from_pairs
 
 # ----------------------------
 # Commands

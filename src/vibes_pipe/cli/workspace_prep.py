@@ -1,11 +1,24 @@
+#!/usr/bin/env python3
 """
-helpers_data_prep.py
+workspace_prep.py
 
-Data preparation helpers for MRE segmentation training/retraining.
+Freeze a dataset into a reproducible workspace layout + manifest.
 
-This module validates pair specs, copies required/optional .mat files into a
-stable workspace layout, and writes a reproducible manifest JSON that references
-workspace-relative destinations.
+Responsibilities:
+  - Validate a pairs spec (pairs.json)
+  - Copy required/optional files into a stable workspace structure:
+        <workspace_root>/{train,val,test}/{id}/X.mat
+        <workspace_root>/{train,val,test}/{id}/GT.mat
+        <workspace_root>/{train,val,test}/{id}/NLI_output.mat           (optional)
+        <workspace_root>/{train,val,test}/{id}/eligible_preds.mat       (optional)
+        <workspace_root>/{train,val,test}/{id}/X.nii or X.nii.gz        (optional; for spacing)
+  - Write a manifest.json describing the frozen snapshot (workspace-relative dst paths)
+  - Record geometry metadata using vibes_pipe.data.io_mat (shape/dtype from .mat,
+    spacing from X_nii if available; mask spacing follows image spacing)
+
+Notes:
+  - This module intentionally avoids duplicating MAT/NIfTI parsing logic.
+    All geometry extraction is delegated to vibes_pipe.data.io_mat.
 """
 
 from __future__ import annotations
@@ -14,23 +27,21 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
-
-try:
-    from scipy.io import loadmat  # type: ignore
-except Exception:  # pragma: no cover
-    loadmat = None  # type: ignore
-
+from vibes_pipe.data.io_mat import extract_geometry, infer_companion_nii
 
 JsonDict = Dict[str, Any]
+
 ALLOWED_SPLITS = {"train", "val", "test"}
+
+# pairs.json required keys
 REQUIRED_KEYS = ("id", "X", "GT")
-OPTIONAL_FILE_KEYS = ("eligible_preds", "NLI_output")
+
+# pairs.json optional keys (paths); X_nii enables spacing extraction from NIfTI
+OPTIONAL_FILE_KEYS = ("eligible_preds", "NLI_output", "X_nii")
 
 
 # -----------------------------
@@ -57,6 +68,10 @@ def write_json_atomic(path: str | Path, obj: Any) -> None:
         tmp_path = Path(tmp.name)
 
     os.replace(tmp_path, dst)
+
+
+def _iso8601_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 # -----------------------------
@@ -98,8 +113,20 @@ def safe_copy(src: str | Path, dst: str | Path, overwrite: bool = False) -> Path
     return dst_p
 
 
-def _iso8601_utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _file_entry(
+    src_path: Path,
+    dst_rel: Path,
+    workspace_root: Path,
+    overwrite: bool,
+    compute_hash: bool,
+) -> JsonDict:
+    dst_abs = workspace_root / dst_rel
+    safe_copy(src_path, dst_abs, overwrite=overwrite)
+    return {
+        "src": str(src_path),
+        "dst": dst_rel.as_posix(),
+        "sha256": sha256_file(dst_abs) if compute_hash else None,
+    }
 
 
 # -----------------------------
@@ -141,6 +168,7 @@ def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
     x_path = _as_abs_file_path(item["X"], field_name="X", pair_id=pair_id)
     gt_path = _as_abs_file_path(item["GT"], field_name="GT", pair_id=pair_id)
 
+    # optional paths (validate if provided)
     optional_paths: Dict[str, Optional[Path]] = {}
     for key in OPTIONAL_FILE_KEYS:
         raw = item.get(key)
@@ -148,6 +176,12 @@ def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
             optional_paths[key] = None
         else:
             optional_paths[key] = _as_abs_file_path(raw, field_name=key, pair_id=pair_id)
+
+    # convenience: if X_nii not provided, try to infer from X.mat location
+    if optional_paths.get("X_nii") is None:
+        inferred = infer_companion_nii(x_path)
+        if inferred is not None:
+            optional_paths["X_nii"] = inferred
 
     meta = item.get("meta", {})
     if meta is None:
@@ -160,6 +194,7 @@ def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
         "split": split,
         "X": x_path,
         "GT": gt_path,
+        "X_nii": optional_paths["X_nii"],
         "eligible_preds": optional_paths["eligible_preds"],
         "NLI_output": optional_paths["NLI_output"],
         "meta": meta,
@@ -183,144 +218,8 @@ def validate_pairs_spec(pairs_spec: Sequence[JsonDict]) -> List[JsonDict]:
 
 
 # -----------------------------
-# MAT geometry extraction
-# -----------------------------
-@dataclass
-class MatGeometry:
-    orig_shape: Optional[List[int]] = None
-    orig_spacing: Optional[List[float]] = None
-    array_key: Optional[str] = None
-    spacing_key: Optional[str] = None
-    error: Optional[str] = None
-
-    def to_dict(self) -> JsonDict:
-        out: JsonDict = {
-            "orig_shape": self.orig_shape,
-            "orig_spacing": self.orig_spacing,
-        }
-        # keep these for debugging, but harmless if you ignore them downstream
-        if self.array_key is not None:
-            out["array_key"] = self.array_key
-        if self.spacing_key is not None:
-            out["spacing_key"] = self.spacing_key
-        if self.error is not None:
-            out["error"] = self.error
-        return out
-
-
-def _find_primary_mat_array(mat_obj: Dict[str, Any], *, mat_path: Path) -> Tuple[str, np.ndarray]:
-    """
-    Pick the primary numeric array from a .mat dict (key, array).
-    Prefers common names; otherwise picks the largest numeric ndarray with ndim>=2.
-    """
-    preferred = ("X", "x", "image", "img", "volume", "data", "GT", "gt", "mask", "label")
-    for key in preferred:
-        val = mat_obj.get(key)
-        if isinstance(val, np.ndarray) and val.ndim >= 2 and np.issubdtype(val.dtype, np.number):
-            return key, val
-
-    best_key: Optional[str] = None
-    best_arr: Optional[np.ndarray] = None
-    for key, val in mat_obj.items():
-        if key.startswith("__"):
-            continue
-        if isinstance(val, np.ndarray) and val.ndim >= 2 and np.issubdtype(val.dtype, np.number):
-            if best_arr is None or val.size > best_arr.size:
-                best_key, best_arr = key, val
-
-    if best_arr is None or best_key is None:
-        raise ValueError(f"No numeric array with ndim>=2 found in MAT file: {mat_path}")
-
-    return best_key, best_arr
-
-
-def _coerce_spacing(raw: Any) -> Optional[List[float]]:
-    """
-    Try to coerce a spacing-like value into [sx, sy, sz].
-    Accepts np.ndarray-like objects with >=3 elements.
-    """
-    if not isinstance(raw, np.ndarray):
-        return None
-    flat = raw.reshape(-1)
-    if flat.size < 3:
-        return None
-    try:
-        return [float(flat[0]), float(flat[1]), float(flat[2])]
-    except Exception:
-        return None
-
-
-def _extract_mat_geometry(mat_path: Path) -> MatGeometry:
-    """
-    Extract original shape and optional spacing from a .mat file.
-    Best-effort; on failure, returns MatGeometry(error=...).
-    """
-    g = MatGeometry()
-
-    try:
-        if mat_path.stat().st_size == 0:
-            g.error = "empty_file"
-            return g
-    except Exception as e:
-        g.error = f"stat_failed:{e}"
-        return g
-
-    if loadmat is None:
-        g.error = "scipy_not_available"
-        return g
-
-    try:
-        mat_obj = loadmat(str(mat_path))
-    except Exception as e:
-        g.error = f"loadmat_failed:{e}"
-        return g
-
-    try:
-        key, arr = _find_primary_mat_array(mat_obj, mat_path=mat_path)
-        g.array_key = key
-        g.orig_shape = [int(v) for v in arr.shape]
-    except Exception as e:
-        g.error = f"no_primary_array:{e}"
-        return g
-
-    # spacing: try common keys
-    for sk in (
-        "spacing",
-        "voxel_spacing",
-        "voxelSpacing",
-        "pixdim",
-        "resolution",
-        "spacing_mm",
-    ):
-        if sk in mat_obj:
-            sp = _coerce_spacing(mat_obj.get(sk))
-            if sp is not None:
-                g.orig_spacing = sp
-                g.spacing_key = sk
-                break
-
-    return g
-
-
-# -----------------------------
 # Workspace + manifest building
 # -----------------------------
-def _file_entry(
-    src_path: Path,
-    dst_rel: Path,
-    workspace_root: Path,
-    overwrite: bool,
-    compute_hash: bool,
-) -> JsonDict:
-    dst_abs = workspace_root / dst_rel
-    safe_copy(src_path, dst_abs, overwrite=overwrite)
-    return {
-        "src": str(src_path),
-        "dst": dst_rel.as_posix(),
-        "sha256": sha256_file(dst_abs) if compute_hash else None,
-    }
-
-
 def build_workspace_from_pairs(
     pairs_spec: Sequence[JsonDict],
     workspace_root: str | Path,
@@ -328,19 +227,20 @@ def build_workspace_from_pairs(
     compute_hash: bool = True,
 ) -> JsonDict:
     """
-    Validate pair specs, copy files into workspace, and return manifest dict.
+    Validate pair specs, copy files into workspace, and return a manifest dict.
 
     Geometry metadata is recorded under:
         meta["geometry_preprocess"] = {
-          orig_image_shape, orig_image_spacing,
-          orig_label_shape, orig_label_spacing,
-          (optional) orig_eligible_preds_shape, orig_eligible_preds_spacing,
-          (optional) orig_nli_output_shape, orig_nli_output_spacing,
-          errors: { ... }   # only if any extraction failed
+          orig_image_shape, orig_image_spacing, orig_image_dtype,
+          orig_label_shape, orig_label_spacing, orig_label_dtype,
+          (optional) orig_eligible_preds_shape, orig_eligible_preds_dtype,
+          (optional) orig_nli_output_shape, orig_nli_output_dtype,
+          errors: {...}  # only if something missing/unreadable
         }
 
-    Geometry is extracted from the COPIED workspace files to ensure the manifest
-    reflects the workspace state (and not an external source that might change).
+    Spacing policy:
+      - Image spacing is extracted from X_nii (preferred/expected in your dataset).
+      - Mask spacing follows image spacing (the mask lives in the same voxel grid).
     """
     normalized = validate_pairs_spec(pairs_spec)
     ws_root = Path(workspace_root).expanduser().resolve()
@@ -356,7 +256,7 @@ def build_workspace_from_pairs(
         split = pair["split"]
         pair_dir = Path(split) / pair_id
 
-        # copy required
+        # ---- copy required ----
         x_entry = _file_entry(
             src_path=pair["X"],
             dst_rel=pair_dir / "X.mat",
@@ -375,13 +275,27 @@ def build_workspace_from_pairs(
         files: JsonDict = {
             "X": x_entry,
             "GT": gt_entry,
+            "X_nii": None,
             "eligible_preds": None,
             "NLI_output": None,
         }
 
-        # copy optional
-        eligible_entry: Optional[JsonDict] = None
-        if pair["eligible_preds"] is not None:
+        # ---- copy optional: X_nii ----
+        if pair.get("X_nii") is not None:
+            src = pair["X_nii"]
+            # preserve .nii vs .nii.gz
+            suffix = "".join(src.suffixes)  # ".nii" or ".nii.gz"
+            xnii_entry = _file_entry(
+                src_path=src,
+                dst_rel=pair_dir / f"X{suffix}",
+                workspace_root=ws_root,
+                overwrite=overwrite,
+                compute_hash=compute_hash,
+            )
+            files["X_nii"] = xnii_entry
+
+        # ---- copy optional: eligible_preds ----
+        if pair.get("eligible_preds") is not None:
             eligible_entry = _file_entry(
                 src_path=pair["eligible_preds"],
                 dst_rel=pair_dir / "eligible_preds.mat",
@@ -391,8 +305,8 @@ def build_workspace_from_pairs(
             )
             files["eligible_preds"] = eligible_entry
 
-        nli_entry: Optional[JsonDict] = None
-        if pair["NLI_output"] is not None:
+        # ---- copy optional: NLI_output ----
+        if pair.get("NLI_output") is not None:
             nli_entry = _file_entry(
                 src_path=pair["NLI_output"],
                 dst_rel=pair_dir / "NLI_output.mat",
@@ -402,37 +316,48 @@ def build_workspace_from_pairs(
             )
             files["NLI_output"] = nli_entry
 
-        # ---- meta: geometry_preprocess (new) ----
+        # ---- geometry meta (delegated to io_mat.py) ----
         meta = dict(pair.get("meta", {}) or {})
         geo = dict(meta.get("geometry_preprocess", {}) or {})
         errors: Dict[str, Any] = {}
 
-        x_geo = _extract_mat_geometry(_abs_from_dst_rel(x_entry["dst"]))
-        gt_geo = _extract_mat_geometry(_abs_from_dst_rel(gt_entry["dst"]))
+        x_mat_abs = _abs_from_dst_rel(x_entry["dst"])
+        gt_mat_abs = _abs_from_dst_rel(gt_entry["dst"])
 
-        geo["orig_image_shape"] = x_geo.orig_shape
-        geo["orig_image_spacing"] = x_geo.orig_spacing
-        geo["orig_label_shape"] = gt_geo.orig_shape
-        geo["orig_label_spacing"] = gt_geo.orig_spacing
+        x_nii_abs: Optional[Path] = None
+        if files.get("X_nii") is not None:
+            x_nii_abs = _abs_from_dst_rel(files["X_nii"]["dst"])
 
-        if x_geo.error:
-            errors["X"] = x_geo.to_dict()
-        if gt_geo.error:
-            errors["GT"] = gt_geo.to_dict()
+        # shapes/dtypes from MAT; spacing from X_nii
+        xg = extract_geometry(x_mat_abs, nii_path=x_nii_abs)
+        gg = extract_geometry(gt_mat_abs, nii_path=None)
 
-        if eligible_entry is not None:
-            ep_geo = _extract_mat_geometry(_abs_from_dst_rel(eligible_entry["dst"]))
-            geo["orig_eligible_preds_shape"] = ep_geo.orig_shape
-            geo["orig_eligible_preds_spacing"] = ep_geo.orig_spacing
-            if ep_geo.error:
-                errors["eligible_preds"] = ep_geo.to_dict()
+        geo["orig_image_shape"] = xg.get("orig_shape")
+        geo["orig_image_spacing"] = xg.get("orig_spacing")
+        geo["orig_image_dtype"] = xg.get("dtype")
 
-        if nli_entry is not None:
-            n_geo = _extract_mat_geometry(_abs_from_dst_rel(nli_entry["dst"]))
-            geo["orig_nli_output_shape"] = n_geo.orig_shape
-            geo["orig_nli_output_spacing"] = n_geo.orig_spacing
-            if n_geo.error:
-                errors["NLI_output"] = n_geo.to_dict()
+        geo["orig_label_shape"] = gg.get("orig_shape")
+        geo["orig_label_spacing"] = xg.get("orig_spacing")  # mask follows image spacing
+        geo["orig_label_dtype"] = gg.get("dtype")
+
+        # optional mats: record shape/dtype (spacing follows image spacing if you ever want it later)
+        if files.get("eligible_preds") is not None:
+            ep_abs = _abs_from_dst_rel(files["eligible_preds"]["dst"])
+            epg = extract_geometry(ep_abs, nii_path=None)
+            geo["orig_eligible_preds_shape"] = epg.get("orig_shape")
+            geo["orig_eligible_preds_dtype"] = epg.get("dtype")
+
+        if files.get("NLI_output") is not None:
+            nli_abs = _abs_from_dst_rel(files["NLI_output"]["dst"])
+            ng = extract_geometry(nli_abs, nii_path=None)
+            geo["orig_nli_output_shape"] = ng.get("orig_shape")
+            geo["orig_nli_output_dtype"] = ng.get("dtype")
+
+        # error reporting for spacing (common pain point)
+        if x_nii_abs is None:
+            errors["X_nii"] = {"error": "missing_X_nii (spacing will be None; resample disabled)"}
+        elif geo["orig_image_spacing"] is None:
+            errors["X_nii"] = {"error": "failed_to_extract_spacing_from_X_nii"}
 
         if errors:
             geo["errors"] = errors
@@ -459,7 +384,7 @@ def build_workspace_from_pairs(
 
 
 # -----------------------------
-# Demo
+# Demo / Script entry
 # -----------------------------
 if __name__ == "__main__":
     root_path = Path("~/Desktop/vibes_pipe/experiments/mre_data_prep_test").expanduser()
@@ -468,10 +393,13 @@ if __name__ == "__main__":
     manifest_path = workspace / "manifest.json"
 
     pairs_data = read_json(pairs_json_path)
+    if isinstance(pairs_data, dict) and "pairs" in pairs_data:
+        pairs_data = pairs_data["pairs"]
+
     if not isinstance(pairs_data, list):
         raise ValueError(
-            "Demo expects pairs.json to contain a top-level list of pair items "
-            "(i.e., directly the `pairs_spec` list)."
+            "Expected pairs.json to contain a top-level list of pair items "
+            "(or a dict with key 'pairs' holding the list)."
         )
 
     manifest_data = build_workspace_from_pairs(
@@ -481,3 +409,5 @@ if __name__ == "__main__":
         compute_hash=True,
     )
     write_json_atomic(manifest_path, manifest_data)
+    print(f"[workspace_prep] manifest: {manifest_path.resolve()}")
+    print(f"[workspace_prep] pairs: {len(manifest_data.get('pairs', []))}")

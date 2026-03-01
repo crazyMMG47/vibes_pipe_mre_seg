@@ -1,4 +1,12 @@
-
+"""
+Bridge between manifest.json and the model training loop. 
+The ManifestDataset can:
+- read manifest.json
+- filter samples by split 
+- load file paths 
+- call Preprocessor.process_pair 
+- return tensors (ready for training)
+"""
 
 from __future__ import annotations
 

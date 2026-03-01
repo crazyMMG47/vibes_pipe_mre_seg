@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-from .io_mat import extract_geometry, find_primary_array, load_mat_dict
+from .io_mat import extract_geometry, find_primary_array, load_mat_dict, infer_companion_nii
 
 
 class Preprocessor:
@@ -61,11 +61,15 @@ class Preprocessor:
         }
 
     def load_mat_volume(
-        self, filepath: str
+        self,
+        mat_path: str,
+        *,
+        nii_path: str | None = None,
     ) -> tuple[np.ndarray, Optional[tuple[float, float, float]], Dict[str, Any]]:
-        mat_obj = load_mat_dict(filepath)
-        volume = find_primary_array(mat_obj, mat_path=filepath).astype(np.float32)
-        geo = extract_geometry(filepath)
+        mat_obj = load_mat_dict(mat_path)
+        volume = find_primary_array(mat_obj, mat_path=mat_path).astype(np.float32)
+
+        geo = extract_geometry(mat_path, nii_path=nii_path)
         spacing = geo.get("orig_spacing")
         spacing_tuple = tuple(spacing) if spacing is not None else None
         return volume, spacing_tuple, geo
@@ -131,21 +135,31 @@ class Preprocessor:
         std = float(np.std(valid_voxels))
         return (volume - mean) / (std + eps)
 
+    from pathlib import Path
+
     def process_pair(self, image_path: str, label_path: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-        image, img_spacing, img_geo = self.load_mat_volume(image_path)
-        label, lbl_spacing, lbl_geo = self.load_mat_volume(label_path)
+        # infer image NIfTI once
+        image_nii = infer_companion_nii(image_path)
+
+        image, img_spacing, img_geo = self.load_mat_volume(image_path, nii_path=str(image_nii) if image_nii else None)
+
+        # label spacing should follow image spacing (even if label has no nifti)
+        label, _, lbl_geo = self.load_mat_volume(label_path, nii_path=None)
+        lbl_geo["orig_spacing"] = img_geo.get("orig_spacing")  # keep meta consistent
+        lbl_spacing = img_spacing
 
         orig_meta = {
             "orig_image_shape": img_geo.get("orig_shape"),
             "orig_image_spacing": img_geo.get("orig_spacing"),
             "orig_label_shape": lbl_geo.get("orig_shape"),
             "orig_label_spacing": lbl_geo.get("orig_spacing"),
+            "image_nii_path": str(image_nii) if image_nii else None,
         }
 
         # CLAHE
         image = self.apply_clahe(image)
 
-        # resample
+        # resample (only if spacing exists)
         if self.resample_cfg.get("enabled", True):
             prefilter = bool(self.resample_cfg.get("prefilter", False))
             order_img = int(self.resample_cfg.get("order_image", 1))
@@ -153,10 +167,9 @@ class Preprocessor:
 
             if img_spacing is not None:
                 image = self.resample(image, img_spacing, self.target_spacing, order=order_img, prefilter=prefilter)
-            if lbl_spacing is not None:
-                label = self.resample(label, lbl_spacing, self.target_spacing, order=order_lbl, prefilter=prefilter)
+                label = self.resample(label, img_spacing, self.target_spacing, order=order_lbl, prefilter=prefilter)
 
-        # ensure label matches image before final resize
+        # ensure label matches image
         if label.shape != image.shape:
             label = self.resize(label, image.shape, order=0, prefilter=False)
 
@@ -167,7 +180,6 @@ class Preprocessor:
 
         # normalize + binarize label
         image = self.normalize(image)
-
         thr = float(self.label_cfg.get("binarize_threshold", 0.5))
         label = (label > thr).astype(getattr(np, str(self.label_cfg.get("dtype", "float32"))))
 

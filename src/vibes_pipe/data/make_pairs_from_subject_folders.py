@@ -1,7 +1,6 @@
 """
-Helper functions that can update the pairs.json.
-
-
+Module for updating the pairs.json.
+prompt users to enter desired json file and file paths for updating pairs.json. 
 """
 
 from __future__ import annotations
@@ -13,7 +12,9 @@ from typing import List, Dict
 def collect_subjects(root: Path) -> List[Dict]:
     """
     Collect subjects by looking at the subjectories from the input directory. 
-    
+    Also defines our interested files here, including t2stack mat, t2stack nifti, stiffness (mu) mat, 
+    predictions path, and so on. 
+    TODO: Add more here as i need. 
     """
     pairs = []
 
