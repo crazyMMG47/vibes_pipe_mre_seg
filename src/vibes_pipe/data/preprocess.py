@@ -69,11 +69,13 @@ class Preprocessor:
         mat_obj = load_mat_dict(mat_path)
         volume = find_primary_array(mat_obj, mat_path=mat_path).astype(np.float32)
 
+        # extract spacing from t2stack nifti for resampling
         geo = extract_geometry(mat_path, nii_path=nii_path)
         spacing = geo.get("orig_spacing")
         spacing_tuple = tuple(spacing) if spacing is not None else None
         return volume, spacing_tuple, geo
 
+    # critical step utilizing 
     def resample(
         self,
         volume: np.ndarray,
