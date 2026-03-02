@@ -8,11 +8,13 @@ The ManifestDataset can:
 - return tensors (ready for training)
 """
 
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+import torch 
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -32,6 +34,24 @@ def _load_mat_array(mat_path: Path) -> np.ndarray:
     md = load_mat_dict(mat_path)
     arr = find_primary_array(md, mat_path=str(mat_path))
     return arr
+
+def manifest_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    The customized collate function is essential. 
+    Without it, problem will incur during batching (when preparing for dataloaders). Since PyTorch automatically 
+    stack tensors even if they are empty. So when "pred" is still empty, stacking None values from optional fields will 
+    causes crash.  
+    """
+    images = torch.stack([torch.from_numpy(b["image"]).float() for b in batch], 0)
+    labels = torch.stack([torch.from_numpy(b["label"]).float() for b in batch], 0)
+    return {
+        "image": images,
+        "label": labels,
+        "id": [b["id"] for b in batch],
+        "split": [b["split"] for b in batch],
+        "meta": [b["meta"] for b in batch],    # list of dicts (None allowed inside)
+        "paths": [b["paths"] for b in batch],  # list of dicts (None allowed inside)
+    }
 
 
 @dataclass
@@ -120,12 +140,12 @@ class ManifestDataset(Dataset):
             files = p.get("files", {})
             pid = str(p.get("id"))
 
-            x_mat = _abs_from_manifest(self.workspace_root, files["X"]["dst"])
-            gt_mat = _abs_from_manifest(self.workspace_root, files["GT"]["dst"])
+            x_mat = _abs_from_manifest(self.workspace_root, files["t2stack"]["dst"])
+            gt_mat = _abs_from_manifest(self.workspace_root, files["GT(human)"]["dst"])
 
             x_nii = None
             if files.get("X_nii") is not None:
-                x_nii = _abs_from_manifest(self.workspace_root, files["X_nii"]["dst"])
+                x_nii = _abs_from_manifest(self.workspace_root, files["t2stack_nii"]["dst"])
 
             nli = None
             if files.get("NLI_output") is not None:
