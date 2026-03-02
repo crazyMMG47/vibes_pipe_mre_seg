@@ -2,76 +2,59 @@
 """
 workspace_prep.py
 
-Freeze a dataset into a reproducible workspace layout + manifest.
+Freeze a dataset into a reproducible workspace layout + manifest, using your
+pairs.json field names (no X/GT renaming).
 
-Responsibilities:
-  - Validate a pairs spec (pairs.json)
-  - Copy required/optional files into a stable workspace structure:
-        <workspace_root>/{train,val,test}/{id}/X.mat
-        <workspace_root>/{train,val,test}/{id}/GT.mat
-        <workspace_root>/{train,val,test}/{id}/NLI_output.mat           (optional)
-        <workspace_root>/{train,val,test}/{id}/eligible_preds.mat       (optional)
-        <workspace_root>/{train,val,test}/{id}/X.nii or X.nii.gz        (optional; for spacing)
-  - Write a manifest.json describing the frozen snapshot (workspace-relative dst paths)
-  - Record geometry metadata using vibes_pipe.data.io_mat (shape/dtype from .mat,
-    spacing from X_nii if available; mask spacing follows image spacing)
+Expected pairs.json schema (per item):
+  Required:
+    - id: str
+    - split: "train"|"val"|"test" (optional; default "train")
+    - t2stack: str (path to .mat)
+    - GT(human): str (path to mask .mat)
+    - t2stack_nii: str (path to .nii/.nii.gz)  # required by your choice
+  Optional:
+    - eligible_preds: None | str | list[str]   (paths to pred mats)
+    - NLI_output: None | str                   (path to Mu mat)
+    - meta: dict
 
-Notes:
-  - This module intentionally avoids duplicating MAT/NIfTI parsing logic.
-    All geometry extraction is delegated to vibes_pipe.data.io_mat.
+Workspace layout:
+  <workspace_root>/{train,val,test}/{id}/
+      t2stack.mat
+      GT(human).mat
+      t2stack.nii or t2stack.nii.gz
+      eligible_preds_00.mat, eligible_preds_01.mat, ... (optional)
+      NLI_output.mat                                  (optional)
+
+Manifest:
+  - Stores workspace-relative dst paths + optional sha256
+  - Records geometry metadata via vibes_pipe.data.io_mat.extract_geometry
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-from vibes_pipe.data.io_mat import extract_geometry, infer_companion_nii
+from vibes_pipe.data.io_mat import extract_geometry
+from vibes_pipe.utils.json_io import iso8601_utc_now, read_json, write_json_atomic
 
 JsonDict = Dict[str, Any]
 
 ALLOWED_SPLITS = {"train", "val", "test"}
 
-# pairs.json required keys
-REQUIRED_KEYS = ("id", "X", "GT")
+# pairs.json required keys (your schema)
+REQ_ID = "id"
+REQ_T2STACK = "t2stack"
+REQ_GT = "GT(human)"
+REQ_T2NII = "t2stack_nii"
 
-# pairs.json optional keys (paths); X_nii enables spacing extraction from NIfTI
-OPTIONAL_FILE_KEYS = ("eligible_preds", "NLI_output", "X_nii")
-
-
-# -----------------------------
-# JSON IO
-# -----------------------------
-def read_json(path: str | Path) -> Any:
-    p = Path(path).expanduser().resolve()
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json_atomic(path: str | Path, obj: Any) -> None:
-    dst = Path(path).expanduser().resolve()
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=dst.parent,
-    ) as tmp:
-        json.dump(obj, tmp, indent=2)
-        tmp.write("\n")
-        tmp_path = Path(tmp.name)
-
-    os.replace(tmp_path, dst)
-
-
-def _iso8601_utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+# pairs.json optional keys (your schema)
+OPT_PREDS = "eligible_preds"   # None | str | list[str]
+OPT_NLI = "NLI_output"         # None | str
+OPT_META = "meta"
 
 
 # -----------------------------
@@ -79,24 +62,19 @@ def _iso8601_utc_now() -> str:
 # -----------------------------
 def sha256_file(path: str | Path) -> str:
     p = Path(path).expanduser().resolve()
-    hasher = hashlib.sha256()
+    h = hashlib.sha256()
     with p.open("rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def safe_copy(src: str | Path, dst: str | Path, overwrite: bool = False) -> Path:
+def safe_copy(src: str | Path, dst: str | Path, *, overwrite: bool = False) -> Path:
     src_p = Path(src).expanduser().resolve()
     dst_p = Path(dst).expanduser().resolve()
 
-    if not src_p.exists():
+    if not src_p.exists() or not src_p.is_file():
         raise FileNotFoundError(f"Source file not found: {src_p}")
-    if not src_p.is_file():
-        raise FileNotFoundError(f"Source path is not a file: {src_p}")
 
     dst_p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -104,16 +82,14 @@ def safe_copy(src: str | Path, dst: str | Path, overwrite: bool = False) -> Path
         raise FileExistsError(f"Destination already exists (overwrite=False): {dst_p}")
 
     with src_p.open("rb") as sf, dst_p.open("wb") as df:
-        while True:
-            chunk = sf.read(1024 * 1024)
-            if not chunk:
-                break
+        for chunk in iter(lambda: sf.read(1024 * 1024), b""):
             df.write(chunk)
 
     return dst_p
 
 
 def _file_entry(
+    *,
     src_path: Path,
     dst_rel: Path,
     workspace_root: Path,
@@ -130,13 +106,11 @@ def _file_entry(
 
 
 # -----------------------------
-# Pair spec validation
+# Pair spec validation + normalization
 # -----------------------------
 def _as_abs_file_path(raw_path: Any, *, field_name: str, pair_id: str) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ValueError(
-            f"Invalid `{field_name}` for pair `{pair_id}`: expected a non-empty string path."
-        )
+        raise ValueError(f"Invalid `{field_name}` for pair `{pair_id}`: expected a non-empty string path.")
     p = Path(raw_path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Missing `{field_name}` file for pair `{pair_id}`: {p}")
@@ -145,15 +119,38 @@ def _as_abs_file_path(raw_path: Any, *, field_name: str, pair_id: str) -> Path:
     return p
 
 
+def _as_abs_file_list(raw: Any, *, field_name: str, pair_id: str) -> Optional[List[Path]]:
+    """
+    Accept:
+      - None
+      - "path"
+      - ["path1", "path2", ...]
+    Return:
+      - None or list[Path]
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return [_as_abs_file_path(raw, field_name=field_name, pair_id=pair_id)]
+    if isinstance(raw, list):
+        paths: List[Path] = []
+        for i, x in enumerate(raw):
+            if not isinstance(x, str) or not x.strip():
+                raise ValueError(f"Invalid `{field_name}[{i}]` for pair `{pair_id}`: expected a non-empty string path.")
+            paths.append(_as_abs_file_path(x, field_name=f"{field_name}[{i}]", pair_id=pair_id))
+        return paths
+    raise ValueError(f"Invalid `{field_name}` for pair `{pair_id}`: expected None, str, or list[str].")
+
+
 def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
     if not isinstance(item, dict):
         raise ValueError(f"pairs_spec[{index}] must be a dict, got {type(item).__name__}.")
 
-    missing = [k for k in REQUIRED_KEYS if k not in item]
+    missing = [k for k in (REQ_ID, REQ_T2STACK, REQ_GT, REQ_T2NII) if k not in item]
     if missing:
         raise ValueError(f"pairs_spec[{index}] missing required keys: {missing}")
 
-    pair_id = item["id"]
+    pair_id = item[REQ_ID]
     if not isinstance(pair_id, str) or not pair_id.strip():
         raise ValueError(f"pairs_spec[{index}]['id'] must be a non-empty string.")
     pair_id = pair_id.strip()
@@ -161,43 +158,35 @@ def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
     split = item.get("split", "train")
     if split not in ALLOWED_SPLITS:
         raise ValueError(
-            f"Invalid split for pair `{pair_id}`: {split!r}. "
-            f"Allowed values: {sorted(ALLOWED_SPLITS)}"
+            f"Invalid split for pair `{pair_id}`: {split!r}. Allowed values: {sorted(ALLOWED_SPLITS)}"
         )
 
-    x_path = _as_abs_file_path(item["X"], field_name="X", pair_id=pair_id)
-    gt_path = _as_abs_file_path(item["GT"], field_name="GT", pair_id=pair_id)
+    t2stack_path = _as_abs_file_path(item[REQ_T2STACK], field_name=REQ_T2STACK, pair_id=pair_id)
+    gt_path = _as_abs_file_path(item[REQ_GT], field_name=REQ_GT, pair_id=pair_id)
+    t2nii_path = _as_abs_file_path(item[REQ_T2NII], field_name=REQ_T2NII, pair_id=pair_id)
 
-    # optional paths (validate if provided)
-    optional_paths: Dict[str, Optional[Path]] = {}
-    for key in OPTIONAL_FILE_KEYS:
-        raw = item.get(key)
-        if raw is None:
-            optional_paths[key] = None
-        else:
-            optional_paths[key] = _as_abs_file_path(raw, field_name=key, pair_id=pair_id)
+    preds_paths = _as_abs_file_list(item.get(OPT_PREDS), field_name=OPT_PREDS, pair_id=pair_id)
 
-    # convenience: if X_nii not provided, try to infer from X.mat location
-    if optional_paths.get("X_nii") is None:
-        inferred = infer_companion_nii(x_path)
-        if inferred is not None:
-            optional_paths["X_nii"] = inferred
+    nli_raw = item.get(OPT_NLI)
+    nli_path: Optional[Path]
+    if nli_raw is None:
+        nli_path = None
+    else:
+        nli_path = _as_abs_file_path(nli_raw, field_name=OPT_NLI, pair_id=pair_id)
 
-    meta = item.get("meta", {})
-    if meta is None:
-        meta = {}
+    meta = item.get(OPT_META, {}) or {}
     if not isinstance(meta, dict):
         raise ValueError(f"`meta` for pair `{pair_id}` must be a dict if provided.")
 
     return {
         "id": pair_id,
         "split": split,
-        "X": x_path,
-        "GT": gt_path,
-        "X_nii": optional_paths["X_nii"],
-        "eligible_preds": optional_paths["eligible_preds"],
-        "NLI_output": optional_paths["NLI_output"],
-        "meta": meta,
+        REQ_T2STACK: t2stack_path,
+        REQ_GT: gt_path,
+        REQ_T2NII: t2nii_path,
+        OPT_PREDS: preds_paths,     # None | list[Path]
+        OPT_NLI: nli_path,          # None | Path
+        OPT_META: meta,
     }
 
 
@@ -207,13 +196,15 @@ def validate_pairs_spec(pairs_spec: Sequence[JsonDict]) -> List[JsonDict]:
 
     normalized: List[JsonDict] = []
     seen_ids = set()
+
     for idx, item in enumerate(pairs_spec):
         pair = _validate_and_normalize_pair(item, idx)
-        pair_id = pair["id"]
-        if pair_id in seen_ids:
-            raise ValueError(f"Duplicate pair id found: `{pair_id}`")
-        seen_ids.add(pair_id)
+        pid = pair["id"]
+        if pid in seen_ids:
+            raise ValueError(f"Duplicate pair id found: `{pid}`")
+        seen_ids.add(pid)
         normalized.append(pair)
+
     return normalized
 
 
@@ -223,141 +214,139 @@ def validate_pairs_spec(pairs_spec: Sequence[JsonDict]) -> List[JsonDict]:
 def build_workspace_from_pairs(
     pairs_spec: Sequence[JsonDict],
     workspace_root: str | Path,
+    *,
     overwrite: bool = False,
     compute_hash: bool = True,
 ) -> JsonDict:
     """
-    Validate pair specs, copy files into workspace, and return a manifest dict.
+    Copy files into a frozen workspace and return a manifest dict.
 
-    Geometry metadata is recorded under:
-        meta["geometry_preprocess"] = {
-          orig_image_shape, orig_image_spacing, orig_image_dtype,
-          orig_label_shape, orig_label_spacing, orig_label_dtype,
-          (optional) orig_eligible_preds_shape, orig_eligible_preds_dtype,
-          (optional) orig_nli_output_shape, orig_nli_output_dtype,
-          errors: {...}  # only if something missing/unreadable
-        }
-
-    Spacing policy:
-      - Image spacing is extracted from X_nii (preferred/expected in your dataset).
-      - Mask spacing follows image spacing (the mask lives in the same voxel grid).
+    Geometry:
+      - image spacing from t2stack_nii
+      - label spacing follows image spacing
     """
     normalized = validate_pairs_spec(pairs_spec)
+
     ws_root = Path(workspace_root).expanduser().resolve()
     ws_root.mkdir(parents=True, exist_ok=True)
 
     manifest_pairs: List[JsonDict] = []
 
-    def _abs_from_dst_rel(dst_rel_str: str) -> Path:
-        return ws_root / Path(dst_rel_str)
+    def _abs_from_dst(dst_rel: str) -> Path:
+        return ws_root / Path(dst_rel)
 
     for pair in sorted(normalized, key=lambda p: p["id"]):
-        pair_id = pair["id"]
-        split = pair["split"]
+        pair_id: str = pair["id"]
+        split: str = pair["split"]
         pair_dir = Path(split) / pair_id
 
         # ---- copy required ----
-        x_entry = _file_entry(
-            src_path=pair["X"],
-            dst_rel=pair_dir / "X.mat",
+        t2_entry = _file_entry(
+            src_path=pair[REQ_T2STACK],
+            dst_rel=pair_dir / "t2stack.mat",
             workspace_root=ws_root,
             overwrite=overwrite,
             compute_hash=compute_hash,
         )
+
         gt_entry = _file_entry(
-            src_path=pair["GT"],
-            dst_rel=pair_dir / "GT.mat",
+            src_path=pair[REQ_GT],
+            dst_rel=pair_dir / "GT(human).mat",
+            workspace_root=ws_root,
+            overwrite=overwrite,
+            compute_hash=compute_hash,
+        )
+
+        # preserve .nii vs .nii.gz
+        t2nii_src: Path = pair[REQ_T2NII]
+        t2nii_suffix = "".join(t2nii_src.suffixes)  # ".nii" or ".nii.gz"
+        t2nii_entry = _file_entry(
+            src_path=t2nii_src,
+            dst_rel=pair_dir / f"t2stack{t2nii_suffix}",
             workspace_root=ws_root,
             overwrite=overwrite,
             compute_hash=compute_hash,
         )
 
         files: JsonDict = {
-            "X": x_entry,
-            "GT": gt_entry,
-            "X_nii": None,
-            "eligible_preds": None,
-            "NLI_output": None,
+            REQ_T2STACK: t2_entry,
+            REQ_GT: gt_entry,
+            REQ_T2NII: t2nii_entry,
+            OPT_PREDS: None,
+            OPT_NLI: None,
         }
 
-        # ---- copy optional: X_nii ----
-        if pair.get("X_nii") is not None:
-            src = pair["X_nii"]
-            # preserve .nii vs .nii.gz
-            suffix = "".join(src.suffixes)  # ".nii" or ".nii.gz"
-            xnii_entry = _file_entry(
-                src_path=src,
-                dst_rel=pair_dir / f"X{suffix}",
-                workspace_root=ws_root,
-                overwrite=overwrite,
-                compute_hash=compute_hash,
-            )
-            files["X_nii"] = xnii_entry
-
-        # ---- copy optional: eligible_preds ----
-        if pair.get("eligible_preds") is not None:
-            eligible_entry = _file_entry(
-                src_path=pair["eligible_preds"],
-                dst_rel=pair_dir / "eligible_preds.mat",
-                workspace_root=ws_root,
-                overwrite=overwrite,
-                compute_hash=compute_hash,
-            )
-            files["eligible_preds"] = eligible_entry
+        # ---- copy optional: eligible_preds (0..n) ----
+        preds: Optional[List[Path]] = pair.get(OPT_PREDS)
+        if preds:
+            pred_entries: List[JsonDict] = []
+            for j, src in enumerate(preds):
+                pred_entries.append(
+                    _file_entry(
+                        src_path=src,
+                        dst_rel=pair_dir / f"eligible_preds_{j:02d}.mat",
+                        workspace_root=ws_root,
+                        overwrite=overwrite,
+                        compute_hash=compute_hash,
+                    )
+                )
+            files[OPT_PREDS] = pred_entries
 
         # ---- copy optional: NLI_output ----
-        if pair.get("NLI_output") is not None:
+        nli_src: Optional[Path] = pair.get(OPT_NLI)
+        if nli_src is not None:
             nli_entry = _file_entry(
-                src_path=pair["NLI_output"],
+                src_path=nli_src,
                 dst_rel=pair_dir / "NLI_output.mat",
                 workspace_root=ws_root,
                 overwrite=overwrite,
                 compute_hash=compute_hash,
             )
-            files["NLI_output"] = nli_entry
+            files[OPT_NLI] = nli_entry
 
-        # ---- geometry meta (delegated to io_mat.py) ----
-        meta = dict(pair.get("meta", {}) or {})
+        # ---- geometry meta ----
+        meta = dict(pair.get(OPT_META, {}) or {})
         geo = dict(meta.get("geometry_preprocess", {}) or {})
         errors: Dict[str, Any] = {}
 
-        x_mat_abs = _abs_from_dst_rel(x_entry["dst"])
-        gt_mat_abs = _abs_from_dst_rel(gt_entry["dst"])
+        t2_mat_abs = _abs_from_dst(t2_entry["dst"])
+        gt_mat_abs = _abs_from_dst(gt_entry["dst"])
+        t2_nii_abs = _abs_from_dst(t2nii_entry["dst"])
 
-        x_nii_abs: Optional[Path] = None
-        if files.get("X_nii") is not None:
-            x_nii_abs = _abs_from_dst_rel(files["X_nii"]["dst"])
-
-        # shapes/dtypes from MAT; spacing from X_nii
-        xg = extract_geometry(x_mat_abs, nii_path=x_nii_abs)
+        xg = extract_geometry(t2_mat_abs, nii_path=t2_nii_abs)   # expects spacing from nii
         gg = extract_geometry(gt_mat_abs, nii_path=None)
 
-        geo["orig_image_shape"] = xg.get("orig_shape")
-        geo["orig_image_spacing"] = xg.get("orig_spacing")
-        geo["orig_image_dtype"] = xg.get("dtype")
+        geo["orig_t2stack_shape"] = xg.get("orig_shape")
+        geo["orig_t2stack_spacing"] = xg.get("orig_spacing")
+        geo["orig_t2stack_dtype"] = xg.get("dtype")
 
-        geo["orig_label_shape"] = gg.get("orig_shape")
-        geo["orig_label_spacing"] = xg.get("orig_spacing")  # mask follows image spacing
-        geo["orig_label_dtype"] = gg.get("dtype")
+        geo["orig_GT(human)_shape"] = gg.get("orig_shape")
+        geo["orig_GT(human)_spacing"] = xg.get("orig_spacing")  # mask follows image spacing
+        geo["orig_GT(human)_dtype"] = gg.get("dtype")
 
-        # optional mats: record shape/dtype (spacing follows image spacing if you ever want it later)
-        if files.get("eligible_preds") is not None:
-            ep_abs = _abs_from_dst_rel(files["eligible_preds"]["dst"])
-            epg = extract_geometry(ep_abs, nii_path=None)
-            geo["orig_eligible_preds_shape"] = epg.get("orig_shape")
-            geo["orig_eligible_preds_dtype"] = epg.get("dtype")
+        if geo["orig_t2stack_spacing"] is None:
+            errors[REQ_T2NII] = {"error": "failed_to_extract_spacing_from_t2stack_nii"}
 
-        if files.get("NLI_output") is not None:
-            nli_abs = _abs_from_dst_rel(files["NLI_output"]["dst"])
+        # optional mats geometry
+        if files.get(OPT_PREDS):
+            preds_geo: List[Dict[str, Any]] = []
+            for ent in files[OPT_PREDS]:
+                ep_abs = _abs_from_dst(ent["dst"])
+                epg = extract_geometry(ep_abs, nii_path=None)
+                preds_geo.append(
+                    {
+                        "dst": ent["dst"],
+                        "shape": epg.get("orig_shape"),
+                        "dtype": epg.get("dtype"),
+                    }
+                )
+            geo["eligible_preds"] = preds_geo
+
+        if files.get(OPT_NLI) is not None:
+            nli_abs = _abs_from_dst(files[OPT_NLI]["dst"])
             ng = extract_geometry(nli_abs, nii_path=None)
-            geo["orig_nli_output_shape"] = ng.get("orig_shape")
-            geo["orig_nli_output_dtype"] = ng.get("dtype")
-
-        # error reporting for spacing (common pain point)
-        if x_nii_abs is None:
-            errors["X_nii"] = {"error": "missing_X_nii (spacing will be None; resample disabled)"}
-        elif geo["orig_image_spacing"] is None:
-            errors["X_nii"] = {"error": "failed_to_extract_spacing_from_X_nii"}
+            geo["orig_NLI_output_shape"] = ng.get("orig_shape")
+            geo["orig_NLI_output_dtype"] = ng.get("dtype")
 
         if errors:
             geo["errors"] = errors
@@ -373,18 +362,17 @@ def build_workspace_from_pairs(
             }
         )
 
-    manifest: JsonDict = {
+    return {
         "schema_version": "1.0",
-        "created_utc": _iso8601_utc_now(),
+        "created_utc": iso8601_utc_now(),
         "workspace_root": str(ws_root),
         "splits": ["train", "val", "test"],
         "pairs": manifest_pairs,
     }
-    return manifest
 
 
 # -----------------------------
-# Demo / Script entry
+# Script entry (optional demo)
 # -----------------------------
 if __name__ == "__main__":
     root_path = Path("~/Desktop/vibes_pipe/experiments/mre_data_prep_test").expanduser()
@@ -395,19 +383,15 @@ if __name__ == "__main__":
     pairs_data = read_json(pairs_json_path)
     if isinstance(pairs_data, dict) and "pairs" in pairs_data:
         pairs_data = pairs_data["pairs"]
-
     if not isinstance(pairs_data, list):
-        raise ValueError(
-            "Expected pairs.json to contain a top-level list of pair items "
-            "(or a dict with key 'pairs' holding the list)."
-        )
+        raise ValueError("Expected pairs.json to be a top-level list (or dict with key 'pairs').")
 
-    manifest_data = build_workspace_from_pairs(
+    manifest = build_workspace_from_pairs(
         pairs_spec=pairs_data,
         workspace_root=workspace,
         overwrite=False,
         compute_hash=True,
     )
-    write_json_atomic(manifest_path, manifest_data)
+    write_json_atomic(manifest_path, manifest)
     print(f"[workspace_prep] manifest: {manifest_path.resolve()}")
-    print(f"[workspace_prep] pairs: {len(manifest_data.get('pairs', []))}")
+    print(f"[workspace_prep] pairs: {len(manifest.get('pairs', []))}")

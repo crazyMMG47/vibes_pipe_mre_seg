@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 from scipy import ndimage
+from pathlib import Path
 
 from .io_mat import extract_geometry, find_primary_array, load_mat_dict, infer_companion_nii
 
@@ -137,11 +138,8 @@ class Preprocessor:
         std = float(np.std(valid_voxels))
         return (volume - mean) / (std + eps)
 
-    from pathlib import Path
-
-    def process_pair(self, image_path: str, label_path: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-        # infer image NIfTI once
-        image_nii = infer_companion_nii(image_path)
+    def process_pair(self, image_path: str, label_path: str, *, image_nii_path: str | None = None):
+        image_nii = Path(image_nii_path) if image_nii_path else infer_companion_nii(image_path)
 
         image, img_spacing, img_geo = self.load_mat_volume(image_path, nii_path=str(image_nii) if image_nii else None)
 

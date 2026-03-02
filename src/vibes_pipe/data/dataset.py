@@ -10,126 +10,205 @@ The ManifestDataset can:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 from torch.utils.data import Dataset
 
-from .preprocess import Preprocessor
+from .io_mat import load_mat_dict, find_primary_array
+from .transforms import Preprocessor 
 
 JsonDict = Dict[str, Any]
+LabelMode = Literal["gt", "pseudo", "prefer_pseudo"]
+
+
+def _abs_from_manifest(workspace_root: Path, dst_rel: str) -> Path:
+    return (workspace_root / Path(dst_rel)).resolve()
+
+
+def _load_mat_array(mat_path: Path) -> np.ndarray:
+    md = load_mat_dict(mat_path)
+    arr = find_primary_array(md, mat_path=str(mat_path))
+    return arr
 
 
 @dataclass
-class Sample:
-    """One resolved sample from the manifest."""
-    pair_id: str
+class SamplePaths:
+    id: str
     split: str
-    x_path: Path
-    gt_path: Path
-    nli_path: Optional[Path] = None
-    eligible_preds_path: Optional[Path] = None
-    meta: Optional[JsonDict] = None
-
-
-def load_manifest(manifest_path: str | Path) -> Tuple[Path, List[JsonDict]]:
-    p = Path(manifest_path).expanduser().resolve()
-    d = json.loads(p.read_text())
-    ws_root = Path(d["workspace_root"]).expanduser().resolve()
-    pairs = d["pairs"]
-    return ws_root, pairs
-
-
-def _resolve_samples(ws_root: Path, pairs: List[JsonDict], split: str) -> List[Sample]:
-    out: List[Sample] = []
-    for pair in pairs:
-        if pair["split"] != split:
-            continue
-
-        files = pair["files"]
-        x = ws_root / files["X"]["dst"]
-        gt = ws_root / files["GT"]["dst"]
-
-        nli = None
-        if files.get("NLI_output") is not None:
-            nli = ws_root / files["NLI_output"]["dst"]
-
-        ep = None
-        if files.get("eligible_preds") is not None:
-            ep = ws_root / files["eligible_preds"]["dst"]
-
-        out.append(
-            Sample(
-                pair_id=pair["id"],
-                split=pair["split"],
-                x_path=x,
-                gt_path=gt,
-                nli_path=nli,
-                eligible_preds_path=ep,
-                meta=pair.get("meta", {}),
-            )
-        )
-    return out
+    x_mat: Path
+    gt_mat: Path
+    x_nii: Optional[Path] = None
+    nli_mat: Optional[Path] = None
+    eligible_preds_mat: Optional[Path] = None
+    # future: pseudo label path (may not exist at start)
+    pseudo_mat: Optional[Path] = None
 
 
 class ManifestDataset(Dataset):
     """
-    Manifest-backed dataset:
-      - uses manifest.json to locate files
-      - runs deterministic preprocessing (resize/normalize/etc.)
-      - optionally applies a transform/augmentation callable
+    Manifest-backed dataset.
+
+    Goals:
+      - Train now with GT masks
+      - Later: support pseudo-label loop without breaking the interface
+      - Keep NLI outputs available for scoring / filtering / curriculum
+
+    Returns dict samples by default (MONAI-friendly).
     """
 
     def __init__(
         self,
-        manifest_path: str | Path,
+        manifest: JsonDict | str | Path,
+        *,
         split: str,
-        preprocessor: Preprocessor,
-        transform: Optional[Callable[[np.ndarray, np.ndarray, JsonDict], Tuple[np.ndarray, np.ndarray, JsonDict]]] = None,
-        return_paths: bool = False,
+        workspace_root: str | Path | None = None,
+        preprocessor: Optional[Preprocessor] = None,
+        label_mode: LabelMode = "gt",
+        pseudo_dir: str | Path | None = None,
+        pseudo_suffix: str = "pseudo.mat",
+        return_dict: bool = True,
+        transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     ) -> None:
-        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        """
+        Args:
+            manifest: dict or path to manifest.json
+            split: train/val/test
+            workspace_root: override if needed; otherwise read from manifest["workspace_root"]
+            preprocessor: your numpy preprocessor (optional). If None, returns raw arrays.
+            label_mode:
+                - "gt": always use GT.mat
+                - "pseudo": require pseudo mask exists
+                - "prefer_pseudo": use pseudo if exists else GT
+            pseudo_dir:
+                Directory to look for pseudo masks (workspace-relative or absolute).
+                Default behavior if provided: <pseudo_dir>/<split>/<id>/<pseudo_suffix>
+            return_dict: if True returns dict with keys "image","label",... (MONAI-friendly)
+            transform: optional callable applied after preprocessing (can be MONAI Compose later)
+        """
         self.split = split
         self.preprocessor = preprocessor
+        self.label_mode = label_mode
+        self.return_dict = return_dict
         self.transform = transform
-        self.return_paths = return_paths
 
-        ws_root, pairs = load_manifest(self.manifest_path)
-        self.ws_root = ws_root
-        self.samples = _resolve_samples(ws_root, pairs, split)
+        if isinstance(manifest, (str, Path)):
+            import json
 
-        if len(self.samples) == 0:
-            raise ValueError(f"No samples found for split={split!r} in {self.manifest_path}")
+            mpath = Path(manifest).expanduser().resolve()
+            self.manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        else:
+            self.manifest = manifest
+
+        ws_root = Path(workspace_root).expanduser().resolve() if workspace_root else Path(self.manifest["workspace_root"]).resolve()
+        self.workspace_root = ws_root
+
+        self.pseudo_dir = None if pseudo_dir is None else Path(pseudo_dir).expanduser().resolve()
+        self.pseudo_suffix = pseudo_suffix
+
+        self.samples: List[SamplePaths] = self._index_manifest()
+
+    def _index_manifest(self) -> List[SamplePaths]:
+        pairs = self.manifest.get("pairs", [])
+        out: List[SamplePaths] = []
+
+        for p in pairs:
+            if p.get("split") != self.split:
+                continue
+            files = p.get("files", {})
+            pid = str(p.get("id"))
+
+            x_mat = _abs_from_manifest(self.workspace_root, files["X"]["dst"])
+            gt_mat = _abs_from_manifest(self.workspace_root, files["GT"]["dst"])
+
+            x_nii = None
+            if files.get("X_nii") is not None:
+                x_nii = _abs_from_manifest(self.workspace_root, files["X_nii"]["dst"])
+
+            nli = None
+            if files.get("NLI_output") is not None:
+                nli = _abs_from_manifest(self.workspace_root, files["NLI_output"]["dst"])
+
+            ep = None
+            if files.get("eligible_preds") is not None:
+                ep = _abs_from_manifest(self.workspace_root, files["eligible_preds"]["dst"])
+
+            pseudo = None
+            if self.pseudo_dir is not None:
+                # default pseudo path convention
+                pseudo = (self.pseudo_dir / self.split / pid / self.pseudo_suffix).resolve()
+                if not pseudo.exists():
+                    pseudo = None
+
+            out.append(
+                SamplePaths(
+                    id=pid,
+                    split=self.split,
+                    x_mat=x_mat,
+                    gt_mat=gt_mat,
+                    x_nii=x_nii,
+                    nli_mat=nli,
+                    eligible_preds_mat=ep,
+                    pseudo_mat=pseudo,
+                )
+            )
+        return out
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def _select_label_path(self, s: SamplePaths) -> Path:
+        if self.label_mode == "gt":
+            return s.gt_mat
+        if self.label_mode == "pseudo":
+            if s.pseudo_mat is None:
+                raise FileNotFoundError(f"label_mode='pseudo' but pseudo mask missing for id={s.id}")
+            return s.pseudo_mat
+        if self.label_mode == "prefer_pseudo":
+            return s.pseudo_mat if s.pseudo_mat is not None else s.gt_mat
+        raise ValueError(f"Unknown label_mode: {self.label_mode}")
+
+    def __getitem__(self, idx: int) -> Dict[str, Any] | Tuple[np.ndarray, np.ndarray]:
         s = self.samples[idx]
+        label_path = self._select_label_path(s)
 
-        # deterministic steps: CLAHE/resample/resize/normalize + label binarize
-        img, lbl, orig_meta = self.preprocessor.process_pair(str(s.x_path), str(s.gt_path))
+        # -------- load + preprocess --------
+        if self.preprocessor is not None:
+            image, label, meta = self.preprocessor.process_pair(
+                str(s.x_mat),
+                str(label_path),
+                image_nii_path=str(s.x_nii) if s.x_nii else None,
+            )
+        else:
+            image = _load_mat_array(s.x_mat).astype(np.float32)
+            label = _load_mat_array(label_path).astype(np.float32)
+            meta = {}
 
-        meta: JsonDict = {}
-        meta.update(s.meta or {})
-        meta["orig_meta"] = orig_meta
-        meta["id"] = s.pair_id
-        meta["split"] = s.split
+        item: Dict[str, Any] = {
+            "id": s.id,
+            "split": s.split,
+            "image": image,      # np.ndarray
+            "label": label,      # np.ndarray
+            "meta": meta,        # dict
+            # keep these paths available for future NLI scoring loops
+            "paths": {
+                "x_mat": str(s.x_mat),
+                "gt_mat": str(s.gt_mat),
+                "x_nii": str(s.x_nii) if s.x_nii else None,
+                "nli_mat": str(s.nli_mat) if s.nli_mat else None,
+                "eligible_preds_mat": str(s.eligible_preds_mat) if s.eligible_preds_mat else None,
+                "pseudo_mat": str(s.pseudo_mat) if s.pseudo_mat else None,
+                "label_used": str(label_path),
+            },
+        }
 
-        # optional random augmentation (train only)
+        # optional MONAI Compose (later)
         if self.transform is not None:
-            img, lbl, meta = self.transform(img, lbl, meta)
+            item = self.transform(item)
 
-        # to torch tensors (C, H, W, D) or (1, H, W, D)
-        img_t = torch.from_numpy(img).float().unsqueeze(0)
-        lbl_t = torch.from_numpy(lbl).float().unsqueeze(0)
+        if self.return_dict:
+            return item
 
-        out: Dict[str, Any] = {"image": img_t, "label": lbl_t, "meta": meta}
-        if self.return_paths:
-
-            out["paths"] = {"X": str(s.x_path), "GT": str(s.gt_path)}
-        return out
+        return item["image"], item["label"]
