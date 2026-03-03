@@ -1,0 +1,9 @@
+noise_augment:
+  # noise profile augmentation 
+  enabled: true
+  strength_range: [0.05, 0.15]  # Randomly picked per batch
+  apply_prob: 0.8               # 80% of images get noise
+
+spatial_transforms:
+  rotate_range: [-10, 10]
+  scale_range: [0.95, 1.05]
