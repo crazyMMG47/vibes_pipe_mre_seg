@@ -3,6 +3,11 @@ preprocess:
   target_spacing: [1.5, 1.5, 1.5]
   target_size: [128, 128, 64]          # set to null to skip final resize
 
+  # Dataset 
+  dataset:
+    label_mode: "gt"          # "gt" | "pseudo" | "prefer_pseudo"
+    pseudo_dir: null          # optional, e.g. "workspace_root/pseudo_labels"
+
   # CLAHE settings (OpenCV)
   clahe:
     enabled: true
