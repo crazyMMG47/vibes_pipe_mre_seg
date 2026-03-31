@@ -16,6 +16,8 @@ Expected pairs.json schema (per item):
     - eligible_preds: None | str | list[str]   (paths to pred mats)
     - NLI_output: None | str                   (path to Mu mat)
     - meta: dict
+    - scanner_type: None | "GE" | "SIEMENS"
+    - OPT_NOISE = "noise_profile"    # None | str
 
 Workspace layout:
   <workspace_root>/{train,val,test}/{id}/
@@ -55,8 +57,8 @@ REQ_T2NII = "t2stack_nii"
 OPT_PREDS = "eligible_preds"   # None | str | list[str]
 OPT_NLI = "NLI_output"         # None | str
 OPT_META = "meta"
-
-
+OPT_SCANNER = "scanner_type"
+OPT_NOISE = "noise_profile"    # none | str
 # -----------------------------
 # File utilities
 # -----------------------------
@@ -178,16 +180,36 @@ def _validate_and_normalize_pair(item: Any, index: int) -> JsonDict:
     if not isinstance(meta, dict):
         raise ValueError(f"`meta` for pair `{pair_id}` must be a dict if provided.")
 
+    scanner_type = item.get(OPT_SCANNER, None)
+    if scanner_type is not None:
+        if not isinstance(scanner_type, str) or not scanner_type.strip():
+            raise ValueError(f"`scanner_type` for pair `{pair_id}` must be a non-empty string if provided.")
+        scanner_type = scanner_type.upper().strip()
+        if scanner_type not in {"GE", "SIEMENS"}:
+            raise ValueError(
+                f"Invalid scanner_type for pair `{pair_id}`: {scanner_type!r}. "
+                "Allowed values: 'GE', 'SIEMENS'."
+            )
+    
+    noise_raw = item.get(OPT_NOISE)
+    noise_path: Optional[Path]
+    if noise_raw is None:
+        noise_path = None
+    else:
+        noise_path = _as_abs_file_path(noise_raw, field_name=OPT_NOISE, pair_id=pair_id)
+        
     return {
-        "id": pair_id,
-        "split": split,
-        REQ_T2STACK: t2stack_path,
-        REQ_GT: gt_path,
-        REQ_T2NII: t2nii_path,
-        OPT_PREDS: preds_paths,     # None | list[Path]
-        OPT_NLI: nli_path,          # None | Path
-        OPT_META: meta,
-    }
+    "id": pair_id,
+    "split": split,
+    REQ_T2STACK: t2stack_path,
+    REQ_GT: gt_path,
+    REQ_T2NII: t2nii_path,
+    OPT_PREDS: preds_paths,
+    OPT_NLI: nli_path,
+    OPT_META: meta,
+    OPT_SCANNER: scanner_type,
+    OPT_NOISE: noise_path
+}
 
 
 def validate_pairs_spec(pairs_spec: Sequence[JsonDict]) -> List[JsonDict]:
@@ -274,6 +296,7 @@ def build_workspace_from_pairs(
             REQ_T2NII: t2nii_entry,
             OPT_PREDS: None,
             OPT_NLI: None,
+            OPT_NOISE: None
         }
 
         # ---- copy optional: eligible_preds (0..n) ----
@@ -304,6 +327,19 @@ def build_workspace_from_pairs(
             )
             files[OPT_NLI] = nli_entry
 
+        # ---- copy optional: noise_profile ----
+        noise_src: Optional[Path] = pair.get(OPT_NOISE)
+        if noise_src is not None:
+            noise_entry = _file_entry(
+                src_path=noise_src,
+                dst_rel=pair_dir / "noise_profile.mat",
+                workspace_root=ws_root,
+                overwrite=overwrite,
+                compute_hash=compute_hash,
+            )
+            files[OPT_NOISE] = noise_entry
+            
+            
         # ---- geometry meta ----
         meta = dict(pair.get(OPT_META, {}) or {})
         geo = dict(meta.get("geometry_preprocess", {}) or {})
@@ -348,6 +384,12 @@ def build_workspace_from_pairs(
             geo["orig_NLI_output_shape"] = ng.get("orig_shape")
             geo["orig_NLI_output_dtype"] = ng.get("dtype")
 
+        if files.get(OPT_NOISE) is not None:
+            noise_abs = _abs_from_dst(files[OPT_NOISE]["dst"])
+            zg = extract_geometry(noise_abs, nii_path=None)
+            geo["orig_noise_profile_shape"] = zg.get("orig_shape")
+            geo["orig_noise_profile_dtype"] = zg.get("dtype")
+            
         if errors:
             geo["errors"] = errors
 
@@ -357,6 +399,7 @@ def build_workspace_from_pairs(
             {
                 "id": pair_id,
                 "split": split,
+                "scanner_type": pair.get(OPT_SCANNER),
                 "files": files,
                 "meta": meta,
             }

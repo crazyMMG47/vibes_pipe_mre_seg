@@ -1,5 +1,5 @@
 import numpy as np
-import Tuple
+from typing import Tuple
 
 
 def compute_ge_noise(magimg: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

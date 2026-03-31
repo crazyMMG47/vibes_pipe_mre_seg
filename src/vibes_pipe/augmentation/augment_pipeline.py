@@ -8,35 +8,32 @@
 # 3. Add the transformed noise of the subject to the spatially augmented image.
 import numpy as np
 import random
-from typing import Optional, Dict, Any, Tuple
-from .noise_augmenter import NoiseAugmenter
-from .basic_augment import SpatialAugmenter
+from typing import Optional, Tuple
+from src.vibes_pipe.augmentation.noise_augment import NoiseAugmenter
+from src.vibes_pipe.augmentation.basic_augment import SpatialAugmenter
 
 class MREAugmentation:
     """
-    Final augmentation pipeline to chain Spatial, Intensity, and Noise augmenters.
-    
-    This pipeline correctly does the following:
-    1. Applies the *same* spatial transform to the image, label, and input noise field.
-    2. Applies intensity augmentation to the spatially-transformed image.
-    3. Adds *new* noise to the augmented image.
+    Augmentation pipeline:
+    1. Spatially augment image + label, while recording params
+    2. Apply same spatial transform to noise fields
+    3. Add transformed noise to transformed image
     """
 
     def __init__(self,
                  spatial_augmenter: Optional[SpatialAugmenter] = None,
                  noise_augmenter: Optional[NoiseAugmenter] = None,
                  apply_prob: float = 0.80):
-        
+
         self.spatial_augmenter = spatial_augmenter
         self.noise_augmenter = noise_augmenter
         self.apply_prob = apply_prob
-        
+
         print(f"✓ MREAugmentation pipeline initialized. Apply prob: {self.apply_prob*100}%")
         if self.spatial_augmenter:
             print("  → Spatial augmentations enabled.")
         if self.noise_augmenter:
             print("  → Additive noise augmentation enabled.")
-
 
     def __call__(self,
                  image: np.ndarray,
@@ -45,54 +42,38 @@ class MREAugmentation:
                  noise_field: Optional[np.ndarray] = None,
                  is_2d: bool = False
                  ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        """
-        Apply the full augmentation chain.
-        
-        Args:
-            image: Input image [D, H, W]
-            label: Input label [D, H, W]
-            subject_id: Subject ID for loading new noise
-            noise_field: The noise profile from the dataset [D, H, W]
-            is_2d: Flag for 2D/3D operations
-        
-        Returns:
-            Augmented (image, label, noise_field) tuple
-        """
-        
-        # --- 1. Randomly skip all augmentations ---
+
         if random.random() > self.apply_prob:
             return image, label, noise_field
 
-        
-        # --- 2. Spatial Augmentation ---
         spatial_params = None
+
+        # 1. Spatial augmentation on image + label
         if self.spatial_augmenter is not None:
-            # Apply aug to image & label, and get the params
             image, label, spatial_params = self.spatial_augmenter(
                 image, label, return_params=True
             )
-            
-            # Apply the *same* transform to the dataset's noise field
+
+            # 2. Apply same spatial transform to existing dataset noise field
             if noise_field is not None and spatial_params is not None:
                 noise_field = self.spatial_augmenter.apply_to(
-                    noise_field, 
-                    spatial_params, 
-                    is_label=False  # Noise is continuous, not discrete
+                    noise_field,
+                    spatial_params,
+                    is_label=False
                 )
-        
-        
-        
-        # --- 4. Additive Noise Augmentation ---
-        # Adds *new* noise to the already-augmented image
+
+        # 3. Load new noise, spatially transform it too, then add it
         if self.noise_augmenter is not None:
-            # Load a new noise field for this subject
             new_noise_to_add = self.noise_augmenter.load_field(subject_id, is_2d)
-            
+
             if new_noise_to_add is not None:
-                # The .add() method handles resizing this new noise
-                # to the (potentially scaled) image shape.
+                if self.spatial_augmenter is not None and spatial_params is not None:
+                    new_noise_to_add = self.spatial_augmenter.apply_to(
+                        new_noise_to_add,
+                        spatial_params,
+                        is_label=False
+                    )
+
                 image = self.noise_augmenter.add(image, new_noise_to_add)
 
-        
-        # --- 5. Return all augmented components ---
         return image, label, noise_field

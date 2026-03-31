@@ -1,0 +1,40 @@
+seed: 42
+device: cuda
+
+model:
+  name: prob_unet3d
+  class_name: ProbUNet3D
+  kwargs:
+    image_channels: 1
+    mask_channels: 1
+    latent_dim: 6
+    feature_channels: [16, 32, 64, 128]
+    num_res_units: 2
+    inject_latent: true
+
+loss:
+  class_name: ProbUNetLoss
+  kwargs:
+    beta_final: 0.1
+    beta_warmup: 20
+    free_bits: 0.0
+    recon_loss:   
+      class_name: FocalDiceComboLoss
+      kwargs:
+        alpha_combo: 0.20
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        smooth: 1.0
+
+optimizer:
+  name: adam
+
+trainer:
+  device: cuda
+  num_epochs: 100
+  grad_clip: 1.0
+  fast_val: true
+  log_every: 1
+  save_path: checkpoints/best_prob_unet_3d.pt
+  final_save_path: checkpoints/last_prob_unet_3d.pt
+  history_save_path: checkpoints/train_history.json

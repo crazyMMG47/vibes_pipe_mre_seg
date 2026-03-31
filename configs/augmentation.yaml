@@ -5,5 +5,5 @@ noise_augment:
   apply_prob: 0.8               # 80% of images get noise
 
 spatial_transforms:
-  rotate_range: [-10, 10]
+  rotatation_range: [-10, 10]
   scale_range: [0.95, 1.05]

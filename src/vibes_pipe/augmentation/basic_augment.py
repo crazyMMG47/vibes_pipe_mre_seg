@@ -45,6 +45,7 @@ class SpatialAugmenter:
             If return_params=False: (image, label)
             If return_params=True: (image, label, params_dict)
         """
+        
         params = {}
         
         # Random rotation

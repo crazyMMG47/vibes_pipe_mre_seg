@@ -1,12 +1,12 @@
-import numpy as np 
-import Tuple, Dict
-
+import numpy as np
+from typing import Tuple, Dict
 
 def compute_siemens_noise(
     img: np.ndarray,
     spatial_dims: int = 3,
     ref_dim: int = None,
-    ref_idx: int = None
+    ref_idx: int = None,
+    show_reference: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
     Compute noise profiles from Siemens MRE raw data.
@@ -78,6 +78,44 @@ def compute_siemens_noise(
         ref_frame = ref_frame.astype(np.float32)
     
     print(f"Reference frame: mean={np.mean(ref_frame):.1f}, std={np.std(ref_frame):.1f}")
+    
+    # Visualize reference selection
+    if show_reference:
+        mid_slice = t2stack.shape[2] // 2
+        
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Use better contrast
+        t2_slice = t2stack[:, :, mid_slice]
+        ref_slice = ref_frame[:, :, mid_slice]
+        
+        vmin_t2, vmax_t2 = np.percentile(t2_slice, [2, 98])
+        vmin_ref, vmax_ref = np.percentile(ref_slice, [2, 98])
+        
+        axes[0].imshow(t2_slice, cmap='gray', vmin=vmin_t2, vmax=vmax_t2)
+        axes[0].set_title(f'T2 Stack (Magnitude)\nMean: {t2_mean:.1f}', 
+                         fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        axes[1].imshow(ref_slice, cmap='gray', vmin=vmin_ref, vmax=vmax_ref)
+        axes[1].set_title(f'Reference Frame\nDim {ref_dim}, Idx {ref_idx}\nMean: {np.mean(ref_frame):.1f}', 
+                         fontsize=12, fontweight='bold')
+        axes[1].axis('off')
+        
+        # Preview the noise
+        preview_noise = t2stack - ref_frame
+        noise_slice = preview_noise[:, :, mid_slice]
+        axes[2].imshow(noise_slice, cmap='seismic', 
+                      vmin=np.percentile(noise_slice, 2), 
+                      vmax=np.percentile(noise_slice, 98))
+        axes[2].set_title(f'Noise Preview\nMean: {np.mean(preview_noise):.2f}', 
+                         fontsize=12, fontweight='bold')
+        axes[2].axis('off')
+        
+        plt.suptitle(f'Siemens Reference Selection - Data: {img.shape}', 
+                     fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
     
     # Compute noise maps
     noise = t2stack - ref_frame

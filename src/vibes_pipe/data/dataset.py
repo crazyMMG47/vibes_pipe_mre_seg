@@ -36,23 +36,25 @@ def _load_mat_array(mat_path: Path) -> np.ndarray:
     return arr
 
 def manifest_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    The customized collate function is essential. 
-    Without it, problem will incur during batching (when preparing for dataloaders). Since PyTorch automatically 
-    stack tensors even if they are empty. So when "pred" is still empty, stacking None values from optional fields will 
-    causes crash.  
-    """
     images = torch.stack([torch.from_numpy(b["image"]).float() for b in batch], 0)
     labels = torch.stack([torch.from_numpy(b["label"]).float() for b in batch], 0)
-    return {
+
+    out = {
         "image": images,
         "label": labels,
         "id": [b["id"] for b in batch],
         "split": [b["split"] for b in batch],
-        "meta": [b["meta"] for b in batch],    # list of dicts (None allowed inside)
-        "paths": [b["paths"] for b in batch],  # list of dicts (None allowed inside)
+        "scanner_type": [b.get("scanner_type") for b in batch],
+        "meta": [b["meta"] for b in batch],
+        "paths": [b["paths"] for b in batch],
     }
 
+    if all("noise" in b for b in batch):
+        out["noise"] = torch.stack(
+            [torch.from_numpy(b["noise"]).float() for b in batch], 0
+        )
+
+    return out
 
 @dataclass
 class SamplePaths:
@@ -65,6 +67,9 @@ class SamplePaths:
     eligible_preds_mat: Optional[Path] = None
     # future: pseudo label path (may not exist at start)
     pseudo_mat: Optional[Path] = None
+    noise_mat: Optional [Path] = None
+    scanner_type: Optional[str] = None
+    noise_mat: Optional[Path] = None
 
 
 class ManifestDataset(Dataset):
@@ -91,6 +96,7 @@ class ManifestDataset(Dataset):
         pseudo_suffix: str = "pseudo.mat",
         return_dict: bool = True,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        augmenter: Optional[Callable[..., tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]] = None,
     ) -> None:
         """
         Args:
@@ -113,7 +119,8 @@ class ManifestDataset(Dataset):
         self.label_mode = label_mode
         self.return_dict = return_dict
         self.transform = transform
-
+        self.augmenter = augmenter
+        
         if isinstance(manifest, (str, Path)):
             import json
 
@@ -135,6 +142,11 @@ class ManifestDataset(Dataset):
         out: List[SamplePaths] = []
 
         for p in pairs:
+            
+            scanner_type = p.get("scanner_type")
+            if scanner_type is not None:
+                scanner_type = str(scanner_type).upper().strip()
+                
             if p.get("split") != self.split:
                 continue
             files = p.get("files", {})
@@ -144,7 +156,7 @@ class ManifestDataset(Dataset):
             gt_mat = _abs_from_manifest(self.workspace_root, files["GT(human)"]["dst"])
 
             x_nii = None
-            if files.get("X_nii") is not None:
+            if files.get("t2stack_nii") is not None:
                 x_nii = _abs_from_manifest(self.workspace_root, files["t2stack_nii"]["dst"])
 
             nli = None
@@ -161,7 +173,11 @@ class ManifestDataset(Dataset):
                 pseudo = (self.pseudo_dir / self.split / pid / self.pseudo_suffix).resolve()
                 if not pseudo.exists():
                     pseudo = None
-
+            
+            noise = None
+            if files.get("subject_noise") is not None:
+                noise = _abs_from_manifest(self.workspace_root, files["subject_noise"]["dst"])
+                
             out.append(
                 SamplePaths(
                     id=pid,
@@ -172,6 +188,8 @@ class ManifestDataset(Dataset):
                     nli_mat=nli,
                     eligible_preds_mat=ep,
                     pseudo_mat=pseudo,
+                    scanner_type=scanner_type,
+                    noise_mat=noise
                 )
             )
         return out
@@ -190,11 +208,12 @@ class ManifestDataset(Dataset):
             return s.pseudo_mat if s.pseudo_mat is not None else s.gt_mat
         raise ValueError(f"Unknown label_mode: {self.label_mode}")
 
+
     def __getitem__(self, idx: int) -> Dict[str, Any] | Tuple[np.ndarray, np.ndarray]:
         s = self.samples[idx]
         label_path = self._select_label_path(s)
 
-        # -------- load + preprocess --------
+        # -------- load image + label --------
         if self.preprocessor is not None:
             image, label, meta = self.preprocessor.process_pair(
                 str(s.x_mat),
@@ -206,29 +225,74 @@ class ManifestDataset(Dataset):
             label = _load_mat_array(label_path).astype(np.float32)
             meta = {}
 
-        item: Dict[str, Any] = {
-            "id": s.id,
-            "split": s.split,
-            "image": image,      # np.ndarray
-            "label": label,      # np.ndarray
-            "meta": meta,        # dict
-            # keep these paths available for future NLI scoring loops
-            "paths": {
-                "x_mat": str(s.x_mat),
-                "gt_mat": str(s.gt_mat),
-                "x_nii": str(s.x_nii) if s.x_nii else None,
-                "nli_mat": str(s.nli_mat) if s.nli_mat else None,
-                "eligible_preds_mat": str(s.eligible_preds_mat) if s.eligible_preds_mat else None,
-                "pseudo_mat": str(s.pseudo_mat) if s.pseudo_mat else None,
-                "label_used": str(label_path),
-            },
-        }
+        # -------- load optional subject-specific noise --------
+        noise = None
+        if getattr(s, "noise_mat", None) is not None:
+            noise = _load_mat_array(s.noise_mat).astype(np.float32)
 
-        # optional MONAI Compose (later)
+        # -------- apply augmentation / noise injection --------
+        if self.augmenter is not None:
+            image, label, noise = self.augmenter(
+                image=image,
+                label=label,
+                subject_id=s.id,
+                noise_field=noise,
+                is_2d=False,
+            )
+
+        # item: Dict[str, Any] = {
+        #     "id": s.id,
+        #     "split": s.split,
+        #     "scanner_type": s.scanner_type,
+        #     "image": image,
+        #     "label": label,
+        #     "meta": meta,
+        #     "paths": {
+        #         "x_mat": str(s.x_mat),
+        #         "gt_mat": str(s.gt_mat),
+        #         "x_nii": str(s.x_nii) if s.x_nii else None,
+        #         "nli_mat": str(s.nli_mat) if s.nli_mat else None,
+        #         "eligible_preds_mat": str(s.eligible_preds_mat) if s.eligible_preds_mat else None,
+        #         "pseudo_mat": str(s.pseudo_mat) if s.pseudo_mat else None,
+        #         "noise_mat": str(s.noise_mat) if getattr(s, "noise_mat", None) else None,
+        #         "label_used": str(label_path),
+        #     },
+        # }
+        
+        image = torch.as_tensor(image, dtype=torch.float32)
+        label = torch.as_tensor(label, dtype=torch.float32)
+
+        if image.ndim == 3:
+            image = image.unsqueeze(0)   # [C, H, W, D] or [C, D, H, W] depending on your convention
+        if label.ndim == 3:
+            label = label.unsqueeze(0)
+        
+        item = {
+        "id": s.id,
+        "scanner_type": s.scanner_type,
+        "image": image,
+        "label": label,
+    }
+
+        if noise is not None:
+            item["noise"] = noise  # optional
+
         if self.transform is not None:
             item = self.transform(item)
 
         if self.return_dict:
             return item
+
+    # return item["image"], item["label"]
+
+    #     if noise is not None:
+    #         item["noise"] = noise
+
+    #     # optional MONAI Compose (later)
+    #     if self.transform is not None:
+    #         item = self.transform(item)
+
+    #     if self.return_dict:
+    #         return item
 
         return item["image"], item["label"]

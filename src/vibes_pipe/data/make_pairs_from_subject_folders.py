@@ -61,10 +61,19 @@ def collect_subjects(
             if strict:
                 raise SystemExit(f"[STRICT] Missing {missing} for subject {subj_id} in {subj_dir}")
             continue
-
+        
+        scanner_type = None
+        # Handle for Helen's Run only
+        # For the future label on scanners, it is depending on the person who run "process_noise_batch..."
+        if subj_id.startswith("G"):
+            scanner_type = "GE"
+        elif subj_id.startswith("S"):
+            scanner_type = "SIEMENS"
+        
         rec: Dict[str, Any] = {
             "id": subj_id,
             "split": "train",  # may be overwritten
+            "scanner_type": scanner_type,   # updated scanner types 
             "t2stack": str(x_path.resolve()),
             "t2stack_nii": str(nifti_path.resolve()) if nifti_path else None,
             "GT(human)": str(gt_path.resolve()),

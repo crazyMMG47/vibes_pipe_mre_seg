@@ -5,12 +5,12 @@ We are going to call this func in the train_driver.
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
+from torch.utils.data import DataLoader, Dataset
 
-from torch.utils.data import DataLoader
+import torch
 
 from .dataset import ManifestDataset, manifest_collate
 from .transforms import Preprocessor
-
 
 def build_loaders(
     manifest_path: str | Path,
