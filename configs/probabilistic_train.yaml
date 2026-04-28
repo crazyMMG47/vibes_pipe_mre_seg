@@ -15,19 +15,19 @@ model:
 loss:
   class_name: ProbUNetLoss
   kwargs:
-    beta_final: 0.1
-    beta_warmup: 20
+    beta_final: 0.2
+    beta_warmup: 80
     free_bits: 0.0
     recon_loss:   
       class_name: FocalDiceComboLoss
       kwargs:
-        alpha_combo: 0.20
+        alpha_combo: 0.0
         focal_alpha: 0.25
         focal_gamma: 2.0
         smooth: 1.0
 
 optimizer:
-  name: adam
+  class_name: Adam
 
 trainer:
   device: cuda
@@ -35,6 +35,6 @@ trainer:
   grad_clip: 1.0
   fast_val: true
   log_every: 1
-  save_path: checkpoints/best_prob_unet_3d.pt
-  final_save_path: checkpoints/last_prob_unet_3d.pt
-  history_save_path: checkpoints/train_history.json
+  save_path: checkpoints/prob_unet_3d_entire_ds.pt
+  final_save_path: checkpoints/last_prob_unet_3d_entire_ds.pt
+  history_save_path: checkpoints/train_history_prob_unet_entire_ds_.json

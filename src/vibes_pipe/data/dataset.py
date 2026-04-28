@@ -194,6 +194,36 @@ class ManifestDataset(Dataset):
             )
         return out
 
+
+    def _extract_orig_geometry(sample) -> tuple[tuple[int, int, int] | None, tuple[float, float, float] | None]:
+        """
+        Tries to read original t2stack geometry from the parsed manifest sample.
+
+        Expected logical fields:
+        sample.geometry["preprocess"]["orig_t2stack_shape"]
+        sample.geometry["preprocess"]["orig_t2stack_spacing"]
+
+        Returns:
+        orig_shape_hwD, orig_spacing_hwD
+        """
+        orig_shape = None
+        orig_spacing = None
+
+        geometry = getattr(sample, "geometry", None)
+        if isinstance(geometry, dict):
+            preprocess_geo = geometry.get("preprocess", {})
+            if isinstance(preprocess_geo, dict):
+                shape = preprocess_geo.get("orig_t2stack_shape", None)
+                spacing = preprocess_geo.get("orig_t2stack_spacing", None)
+
+                if shape is not None and len(shape) == 3:
+                    orig_shape = tuple(int(v) for v in shape)
+
+                if spacing is not None and len(spacing) == 3:
+                    orig_spacing = tuple(float(v) for v in spacing)
+
+        return orig_shape, orig_spacing
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -240,59 +270,39 @@ class ManifestDataset(Dataset):
                 is_2d=False,
             )
 
-        # item: Dict[str, Any] = {
-        #     "id": s.id,
-        #     "split": s.split,
-        #     "scanner_type": s.scanner_type,
-        #     "image": image,
-        #     "label": label,
-        #     "meta": meta,
-        #     "paths": {
-        #         "x_mat": str(s.x_mat),
-        #         "gt_mat": str(s.gt_mat),
-        #         "x_nii": str(s.x_nii) if s.x_nii else None,
-        #         "nli_mat": str(s.nli_mat) if s.nli_mat else None,
-        #         "eligible_preds_mat": str(s.eligible_preds_mat) if s.eligible_preds_mat else None,
-        #         "pseudo_mat": str(s.pseudo_mat) if s.pseudo_mat else None,
-        #         "noise_mat": str(s.noise_mat) if getattr(s, "noise_mat", None) else None,
-        #         "label_used": str(label_path),
-        #     },
-        # }
-        
+        # -------- enforce tensor + dtype + channel dim --------
         image = torch.as_tensor(image, dtype=torch.float32)
         label = torch.as_tensor(label, dtype=torch.float32)
 
         if image.ndim == 3:
-            image = image.unsqueeze(0)   # [C, H, W, D] or [C, D, H, W] depending on your convention
+            image = image.unsqueeze(0)
         if label.ndim == 3:
             label = label.unsqueeze(0)
-        
-        item = {
-        "id": s.id,
-        "scanner_type": s.scanner_type,
-        "image": image,
-        "label": label,
-    }
 
         if noise is not None:
-            item["noise"] = noise  # optional
+            noise = torch.as_tensor(noise, dtype=torch.float32)
+            if noise.ndim == 3:
+                noise = noise.unsqueeze(0)
+
+        # -------- original geometry from manifest --------
+        orig_shape, orig_spacing = _extract_orig_geometry(s)
+
+        item = {
+            "id": str(s.id),
+            "scanner_type": str(s.scanner_type),
+            "image": image,
+            "label": label,
+            "orig_t2stack_shape": orig_shape,
+            "orig_t2stack_spacing": orig_spacing,
+        }
+
+        if noise is not None:
+            item["noise"] = noise
 
         if self.transform is not None:
             item = self.transform(item)
 
         if self.return_dict:
             return item
-
-    # return item["image"], item["label"]
-
-    #     if noise is not None:
-    #         item["noise"] = noise
-
-    #     # optional MONAI Compose (later)
-    #     if self.transform is not None:
-    #         item = self.transform(item)
-
-    #     if self.return_dict:
-    #         return item
 
         return item["image"], item["label"]

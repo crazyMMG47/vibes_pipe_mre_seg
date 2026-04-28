@@ -160,6 +160,28 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def assign_manual_splits(pairs: List[Dict[str, Any]]) -> None:
+    # experiment 1
+    """
+    Assigns splits based on hardcoded subject lists.
+    """
+    TRAIN_IDS = {"G030", "G017", "G052", "G022", "G007", "G019", "G035", "G059", "G048", "G013", "G060", "S021", "S008", "S053", "S066", "S032", "S014", "S035", "S072", "S060", "S002", "S044", "S050", "S026"}
+    VAL_IDS = {"G056", "S069", "G053", "G062", "G010", "S006", "G049", "G050", "G046", "G041", "S004", "S020", "S061", "G018", "G021", "G020", "S024", "S067", "S056", "G045", "S048", "G004", "G043", "G002", "S045", "G051", "S068"}
+    TEST_IDS = {"G044", "G026", "S065", "S027", "G038", "S042", "S057", "S022", "G006", "S007", "S029", "G033", "G058", "G036", "G009", "G001", "S003", "S010", "G029", "S036", "S031", "G003", "S052", "S054", "G023", "S051", "S012", "G008"}
+
+    for rec in pairs:
+        sid = rec["id"]
+        if sid in TRAIN_IDS:
+            rec["split"] = "train"
+        elif sid in VAL_IDS:
+            rec["split"] = "val"
+        elif sid in TEST_IDS:
+            rec["split"] = "test"
+        else:
+            # Fallback for subjects found in folders but not in your manual lists
+            rec["split"] = "excluded"
+            
+            
 def main() -> int:
     args = parse_args()
 
