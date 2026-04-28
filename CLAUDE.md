@@ -4,6 +4,26 @@
 End-to-end deep learning pipeline for **3-D MRE (Magnetic Resonance Elastography) brain segmentation**.
 The model learns from both human GT masks and NLI-derived pseudo-labels, with scanner-aware noise augmentation for GE and Siemens scanners.
 
+## GUI (Prediction Viewer)
+
+Located in `gui/`. FastAPI backend + React/Vite frontend for reviewing MC predictions and exporting pseudo-GT.
+
+| Component | Location |
+|-----------|----------|
+| Backend entry | `gui/backend/main.py` — FastAPI app |
+| Config | `gui/backend/config.py` — reads `OUTPUT_DIR`, `MANIFEST_PATH`, `WORKSPACE_ROOT`, `PORT` from env |
+| Routers | `gui/backend/routers/{subjects,slices,metrics,export}.py` |
+| Services | `gui/backend/services/{output_reader,manifest_reader,slice_renderer}.py` |
+| Frontend entry | `gui/frontend/src/App.tsx` |
+| Components | `gui/frontend/src/components/` |
+| Run (dev) | `./gui/run_dev.sh` — backend `:8000`, UI `:5173` (requires `torch3090` conda env) |
+| Run (prod) | `./gui/run_prod.sh` — builds React, serves all from `:8000` |
+| Roadmap | `gui_roadmap.md` |
+
+Key conventions: backend renders PNG slices server-side; frontend only displays `<img>`; pseudo-GT writes to `<workspace_root>/<split>/<id>/pseudo_mask.mat` matching `ManifestDataset` convention.
+
+All phases (0–6) complete. Full setup, pipeline, and GUI usage documented in `README.md`.
+
 ## Architecture at a glance
 
 | Component | Key file(s) |

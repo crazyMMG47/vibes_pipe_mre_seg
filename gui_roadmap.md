@@ -4,6 +4,18 @@
 **Root:** `gui/` subfolder inside this repo  
 **Purpose:** Browse MC-sampled predictions per subject, compare against GT, inspect metrics, and promote the best prediction to pseudo-GT.
 
+## Status
+
+| Phase | Status |
+|-------|--------|
+| 0 — Scaffold | ✅ Complete |
+| 1 — Backend data layer | ✅ Complete |
+| 2 — Core slice viewer | ✅ Complete |
+| 3 — Metrics panel | ✅ Complete (built into Phase 2 delivery) |
+| 4 — Candidate selection + export | ✅ Complete (built into Phase 2 delivery) |
+| 5 — Stiffness integration | ✅ Complete (built into Phase 2 delivery) |
+| 6 — Hardening + docs | ✅ Complete |
+
 ---
 
 ## Final directory layout (target state)
